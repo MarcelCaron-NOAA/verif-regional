@@ -1,0 +1,4 @@
+[submodule "evs"]
+	path = evs
+	url = https://github.com/NOAA-EMC/EVS.git
+	branch = develop
