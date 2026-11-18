@@ -123,10 +123,20 @@ def spec(config_path: Path, evs_option: str | None = None):
     run_dir = output_root / case_name
     evs_root = expand(evs_option or os.getenv('VERIF_REGIONAL_EVS_ROOT') or str(REPO / 'evs'))
     missing_evs = [x for x in REQUIRED_EVS_FILES if not (evs_root / x).is_file()]
-    env_setup = cfg.get('environment', {}).get('setup_script', '')
-    fix_root = cfg.get('environment', {}).get('fix_root', '')
     machine_cfg = expand(cfg['machine']['profile'], config_path.parent)
     machine = read_yaml(machine_cfg)
+    experiment_env = cfg.get('environment') or {}
+    machine_env = machine.get('environment') or {}
+    exp_setup = experiment_env.get('setup_script') or ''
+    exp_fix = experiment_env.get('fix_root') or ''
+    env_setup = exp_setup or machine_env.get('setup_script') or ''
+    fix_root = exp_fix or machine_env.get('fix_root') or ''
+    env_setup_base = (
+        config_path.parent if exp_setup else machine_cfg.parent
+    )
+    fix_root_base = (
+        config_path.parent if exp_fix else machine_cfg.parent
+    )
     return dict(
         experiment=e['name'], init_date=init.strftime('%Y%m%d'), cycle=init.strftime('%H'),
         fhr=fhr, vdate=valid.strftime('%Y%m%d'), vhour=valid.strftime('%H'),
@@ -135,8 +145,9 @@ def spec(config_path: Path, evs_option: str | None = None):
         obs_file=str(obs_file) if obs_file else None,
         obs_relative=f'rrfs.{valid:%Y%m%d}/rrfs.t{valid:%H}z.prepbufr.tm00',
         obs_warnings=obs_warnings, evs_root=str(evs_root), missing_evs=missing_evs,
-        run_dir=str(run_dir), env_setup=str(expand(env_setup, config_path.parent)) if env_setup else '',
-        fix_root=str(expand(fix_root, config_path.parent)) if fix_root else '',
+        run_dir=str(run_dir),
+        env_setup=str(expand(env_setup, env_setup_base)) if env_setup else '',
+        fix_root=str(expand(fix_root, fix_root_base)) if fix_root else '',
         machine=machine, machine_config=str(machine_cfg),
     )
 
@@ -209,9 +220,6 @@ def stage(s: dict):
     else:
         print(f'Forecast TMP2m GRIB2 field: {field_status}')
     run = Path(s['run_dir'])
-    job_name = (
-        f"vr_{s['init_date'][4:]}{s['cycle']}_f{s['fhr']:03d}"
-    )
     for folder in ['input', 'jobs', 'logs', 'work']:
         (run / folder).mkdir(parents=True, exist_ok=True)
     staged_fcst = run / 'input' / s['evs_relative']
@@ -262,6 +270,9 @@ def write_job(s: dict, manifest_path: Path):
     if not re.fullmatch(r'\d{2}:\d{2}:\d{2}', walltime):
         raise ValueError('walltime must be HH:MM:SS')
     run = Path(s['run_dir'])
+    job_name = (
+        f"vr_{s['init_date'][4:]}{s['cycle']}_f{s['fhr']:03d}"
+    )
     command = REPO / 'scripts' / 'stats' / 'run_rrfs_metar_tmp2m.sh'
     lines = [
         '#!/usr/bin/env bash',
@@ -275,6 +286,7 @@ def write_job(s: dict, manifest_path: Path):
         '',
         'set -euo pipefail',
         'export OMP_NUM_THREADS=1',
+        f'export VR_EVS_ROOT={shlex.quote(s["evs_root"])}',
         f'export VR_ENV_SETUP={shlex.quote(s["env_setup"])}',
         f'export VR_FIX_ROOT={shlex.quote(s["fix_root"])}',
         f'bash {shlex.quote(str(command))} {shlex.quote(str(manifest_path))}',
