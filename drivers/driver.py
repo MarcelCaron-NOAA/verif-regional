@@ -128,10 +128,12 @@ def spec(config_path: Path, evs_option: str | None = None):
     grid2obs = verification['grid2obs']
     obs_types = grid2obs.get('observations', [])
     variables = grid2obs.get('variables', [])
-    if obs_types != ['metar'] or variables != ['TMP2m']:
+    if obs_types != ['metar'] or variables not in (
+            ['TMP2m'], ['DPT2m']
+            ):
         raise ValueError(
-            "Current proof of concept supports only "
-            "observations: [metar], variables: [TMP2m]"
+            "Currently supported: RRFS CONUS grid2obs, "
+            "METAR, with one variable (TMP2m or DPT2m)"
         )
     e = cfg['experiment']
     init, valid, fhr = time_case(e)
@@ -204,20 +206,39 @@ def issues(s: dict) -> list[str]:
         errors.append(f"EVS masks directory missing: {fix_root}/masks")
     return errors
 
+def field_check(source: str, variable: str):
+    patterns = {
+        'TMP2m': ':TMP:2 m above ground:',
+        'DPT2m': ':DPT:2 m above ground:',
+    }
 
-def field_check(source: str):
+    pattern = patterns[variable]
     wgrib = shutil.which('wgrib2')
+
     if not wgrib or not Path(source).is_file():
         return 'not checked (wgrib2 unavailable or forecast missing)'
-    proc = subprocess.run([wgrib, source, '-match', ':TMP:2 m above ground:', '-s'],
-                          capture_output=True, text=True)
+
+    proc = subprocess.run(
+        [wgrib, source, '-match', pattern, '-s'],
+        capture_output=True,
+        text=True,
+    )
+
     if proc.returncode != 0:
-        return 'FAILED: wgrib2 returned '+str(proc.returncode)+': '+proc.stderr.strip()[:250]
-    return 'present' if proc.stdout.strip() else 'MISSING: TMP at 2 m above ground'
+        return (
+            f'FAILED: wgrib2 returned {proc.returncode}: '
+            + proc.stderr.strip()[:250]
+        )
+
+    return 'present' if proc.stdout.strip() else f'MISSING: {variable}'
 
 
 def show_plan(s: dict, check_field: bool = False):
-    print(f"Case:    {s['experiment']}  RRFS CONUS METAR TMP2m")
+    print(
+        f"Case:    {s['experiment']}  "
+        f"{s['model'].upper()} {s['domain'].upper()} "
+        f"{s['obs_type'].upper()} {s['variable']}"
+    )
     print(f"Init:    {s['init_date']} {s['cycle']}Z  F{s['fhr']:03d}")
     print(f"Valid:   {s['vdate']} {s['vhour']}Z")
     print(f"Source:  {s['source']}")
@@ -230,7 +251,10 @@ def show_plan(s: dict, check_field: bool = False):
     print(f"Output:  {s['run_dir']}/work/grid2obs/METplus_output/")
     print('Steps:   stage symlinks > preprocess ADPSFC > EVS PB2NC > EVS PointStat')
     if check_field:
-        print('TMP2m:   '+field_check(s['source']))
+        print(
+            f"{s['variable']}:   " 
+            + field_check(s['source'], s['variable'])
+        )
     problems = issues(s)
     if problems:
         print('\nNeeds attention:')
@@ -256,14 +280,22 @@ def stage(s: dict):
     problems = issues(s)
     if problems:
         raise RuntimeError('Cannot stage until required inputs exist:\n  - '+'\n  - '.join(problems))
+    
     # Perform a GRIB field-level preflight when wgrib2 is available.
-    field_status = field_check(s['source'])
+    field_status = field_check(s['source'], s['variable'])
     if field_status.startswith(('MISSING:', 'FAILED:')):
-        raise RuntimeError(f'Forecast field check failed: {field_status}')
+        raise RuntimeError(
+            f'Forecast field check failed: {field_status}'
+        )
     if field_status.startswith('not checked'):
-        print('WARNING: wgrib2 unavailable; TMP2m field not inspected.')
+        print(
+            f'WARNING: {s["variable"]} GRIB2 field not inspected: '
+            f'{field_status}'
+        )
     else:
-        print(f'Forecast TMP2m GRIB2 field: {field_status}')
+        print(
+            f'Forecast {s["variable"]} GRIB2 field: {field_status}'
+        )
     run = Path(s['run_dir'])
     for folder in ['input', 'jobs', 'logs', 'work']:
         (run / folder).mkdir(parents=True, exist_ok=True)

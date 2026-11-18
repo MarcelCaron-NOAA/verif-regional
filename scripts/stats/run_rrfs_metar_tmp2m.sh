@@ -104,7 +104,8 @@ export FHR_GROUP_LIST=SHORT
 export FHR_START="$VR_FHR" FHR_END="$VR_FHR" FHR_INCR=1
 export FHR_END_SHORT="$VR_FHR" FHR_INCR_SHORT=1
 export SKIP_IF_OUTPUT_EXISTS=no
-export VAR_NAME="$VR_VARIABLE" job_name=vr_rrfs_tmp2m
+export VAR_NAME="$VR_VARIABLE" 
+export job_name="vr_${MODELNAME}_${VAR_NAME}"
 export MET_PLUS_OUT="$DATA/$VERIF_CASE/METplus_output"
 export MET_CONFIG_OVERRIDES=''
 export OMP_NUM_THREADS=1
@@ -156,7 +157,7 @@ PY
 # shellcheck disable=SC1090
 source "$var_env"
 
-echo "Step 3: upstream METplus PointStat configuration (RRFS TMP Z2 vs METAR TMP Z2)"
+echo "Step 3: EVS PointStat ($MODELNAME $VAR_NAME vs $VERIF_TYPE)"
 run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
     -c "$MET_PLUS_CONF/PointStat_fcstCAM_obsMETAR.conf"
 
