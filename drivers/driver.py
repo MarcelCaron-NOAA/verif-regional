@@ -90,13 +90,22 @@ def source_paths(config: dict, initial: dt.datetime, valid: dt.datetime, fhr: in
     return source, Path(rel_evs)
 
 
-def resolve_obs_root(value: str, valid: dt.datetime):
+def resolve_obs_root(
+    value: str, 
+    valid: dt.datetime,
+    auto_root: str | None = None,
+):
     rel = f'rrfs.{valid:%Y%m%d}/rrfs.t{valid:%H}z.prepbufr.tm00'
     if value.strip().lower() != 'auto':
         base = expand(value)
         return base, base / rel, []
     env_ver = os.getenv('obsproc_ver', '')
-    base_root = Path('/lfs/h1/ops/prod/com/obsproc')
+    if not auto_root:
+        raise ValueError(
+            "observations.root is 'auto', but the machine profile "
+            "does not define paths.obsproc_root"
+        )
+    base_root = expand(auto_root)
     candidates = []
     if env_ver:
         candidates.append(base_root / env_ver / rel)
@@ -117,14 +126,20 @@ def spec(config_path: Path, evs_option: str | None = None):
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', e['name']):
         raise ValueError('experiment.name must contain only letters, numbers, hyphen, underscore')
     source, evs_relative = source_paths(cfg, init, valid, fhr)
-    obs_root, obs_file, obs_warnings = resolve_obs_root(cfg['observations'].get('root', 'auto'), valid)
+    machine_cfg = expand(
+        cfg['machine']['profile'], config_path.parent
+    )
+    machine = read_yaml(machine_cfg)
+    obs_root, obs_file, obs_warnings = resolve_obs_root(
+        cfg['observations'].get('root', 'auto'), 
+        valid,
+        (machine.get('paths') or {}).get('obsproc_root'),
+    )
     output_root = expand(cfg['output']['root'])
     case_name = f"{e['name']}_{init:%Y%m%d%H}_f{fhr:03d}"
     run_dir = output_root / case_name
     evs_root = expand(evs_option or os.getenv('VERIF_REGIONAL_EVS_ROOT') or str(REPO / 'evs'))
     missing_evs = [x for x in REQUIRED_EVS_FILES if not (evs_root / x).is_file()]
-    machine_cfg = expand(cfg['machine']['profile'], config_path.parent)
-    machine = read_yaml(machine_cfg)
     experiment_env = cfg.get('environment') or {}
     machine_env = machine.get('environment') or {}
     exp_setup = experiment_env.get('setup_script') or ''
@@ -160,6 +175,20 @@ def issues(s: dict) -> list[str]:
         errors.extend(s['obs_warnings'] or ['Obsproc file missing: '+str(s['obs_file'])])
     if s['missing_evs']:
         errors.append(f"EVS files missing under {s['evs_root']}: {', '.join(s['missing_evs'])}")
+    
+    env_setup = s['env_setup']
+    if not env_setup:
+        errors.append("No machine environment setup script configured")
+    elif not Path(env_setup).is_file():
+        errors.append(f"Environment setup script missing: {env_setup}")
+    
+    fix_root = s['fix_root']
+    if not fix_root:
+        errors.append("No EVS fix directory configured")
+    elif not Path(fix_root).is_dir():
+        errors.append(f"EVS fix directory missing: {fix_root}")
+    elif not (Path(fix_root) / 'masks').is_dir():
+        errors.append(f"EVS masks directory missing: {fix_root}/masks")
     return errors
 
 
@@ -182,6 +211,9 @@ def show_plan(s: dict, check_field: bool = False):
     print(f"Obs:     {s['obs_file'] or '(unresolved)'}")
     print(f"Staging: {s['run_dir']}/input/{s['evs_relative']}")
     print(f"EVS:     {s['evs_root']}")
+    print(f"Machine: {s['machine'].get('name', 'unknown')}")
+    print(f"Env:     {s['env_setup']}")
+    print(f"Fix:     {s['fix_root']}")
     print(f"Output:  {s['run_dir']}/work/grid2obs/METplus_output/")
     print('Steps:   stage symlinks > preprocess ADPSFC > EVS PB2NC > EVS PointStat')
     if check_field:
@@ -192,7 +224,7 @@ def show_plan(s: dict, check_field: bool = False):
         for problem in problems:
             print('  - '+problem)
     else:
-        print('\nInputs and EVS source found. (MET environment still unverified.)')
+        print('\nPreflight checks passed.  Runtime environment will be initialized by PBS.')
     return problems
 
 
@@ -253,6 +285,16 @@ def stage(s: dict):
     return target
 
 
+def job_details(s: dict):
+    job_name = (
+        f"vr_{s['init_date'][4:]}{s['cycle']}_f{s['fhr']:03d}"
+    )
+    log_file = (
+        Path(s['run_dir']) / 'logs' / f'{job_name}.log'
+    )
+    return job_name, log_file
+
+
 def write_job(s: dict, manifest_path: Path):
     m = s['machine']
     if m.get('scheduler') != 'pbs':
@@ -270,9 +312,7 @@ def write_job(s: dict, manifest_path: Path):
     if not re.fullmatch(r'\d{2}:\d{2}:\d{2}', walltime):
         raise ValueError('walltime must be HH:MM:SS')
     run = Path(s['run_dir'])
-    job_name = (
-        f"vr_{s['init_date'][4:]}{s['cycle']}_f{s['fhr']:03d}"
-    )
+    job_name, log_file = job_details(s)
     command = REPO / 'scripts' / 'stats' / 'run_rrfs_metar_tmp2m.sh'
     lines = [
         '#!/usr/bin/env bash',
@@ -282,13 +322,14 @@ def write_job(s: dict, manifest_path: Path):
         f'#PBS -l select=1:ncpus=1:ompthreads=1:mem={memory}',
         f'#PBS -l walltime={walltime}',
         '#PBS -j oe',
-        f'#PBS -o {run / "logs" / (job_name + ".log")}',
+        f'#PBS -o {log_file}',
         '',
         'set -euo pipefail',
         'export OMP_NUM_THREADS=1',
         f'export VR_EVS_ROOT={shlex.quote(s["evs_root"])}',
         f'export VR_ENV_SETUP={shlex.quote(s["env_setup"])}',
         f'export VR_FIX_ROOT={shlex.quote(s["fix_root"])}',
+        f'export VR_MACHINE={shlex.quote(str(m["name"]))}',
         f'bash {shlex.quote(str(command))} {shlex.quote(str(manifest_path))}',
         '',
     ]
@@ -309,13 +350,31 @@ def main(argv=None):
     try:
         s = spec(args.config.resolve(), args.evs_root)
         if args.command == 'plan':
-            show_plan(s, check_field=args.check_fields)
+            problems = show_plan(s, check_field=args.check_fields)
+            return 1 if problems else 0
         else:
             manifest_path = stage(s)
             if args.command in ('write-job', 'submit'):
                 job = write_job(s, manifest_path)
                 if args.command == 'submit':
-                    subprocess.run(['qsub', '-V', str(job)], check=True)
+                    result = subprocess.run(
+                        ['qsub', '-V', str(job)],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+
+                    job_name, log_file = job_details(s)
+
+                    print("\nPBS job submitted")
+                    print(f"  Job ID:     {result.stdout.strip()}")
+                    print(f"  Job name:   {job_name}")
+                    print(f"  Job script: {job}")
+                    print(f"  Log:        {log_file}")
+                    print(
+                        f"  Statistics: "
+                        f"{Path(s['run_dir']) / 'work/grid2obs/METplus_output'}"
+                    )
         return 0
     except (ValueError, KeyError, RuntimeError, OSError, subprocess.CalledProcessError) as exc:
         print(f'ERROR: {exc}', file=sys.stderr)

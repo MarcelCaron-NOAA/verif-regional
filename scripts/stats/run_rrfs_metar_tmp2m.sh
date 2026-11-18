@@ -57,7 +57,8 @@ done
 command -v run_metplus.py >/dev/null || { echo 'run_metplus.py not on PATH' >&2; exit 4; }
 [[ -x "$bufr_ROOT/bin/split_by_subset" ]] || { echo "Missing $bufr_ROOT/bin/split_by_subset" >&2; exit 4; }
 
-export machine=WCOSS2 NET=evs STEP=stats COMPONENT=cam RUN=atmos
+export machine="${VR_MACHINE:?Machine name missing from profile}"
+export NET=evs STEP=stats COMPONENT=cam RUN=atmos
 export VERIF_CASE=grid2obs MODELNAME=rrfs
 export DATA="$VR_RUN_DIR/work"
 export VDATE="$VR_VDATE" VHOUR="$VR_VHOUR" FHR="$(printf '%02d' "$VR_FHR")"
