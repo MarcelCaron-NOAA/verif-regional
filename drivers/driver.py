@@ -57,8 +57,6 @@ def expand(path: str, relative_to: Path | None = None) -> Path:
 def time_case(expt: dict) -> tuple[dt.datetime, dt.datetime, int]:
     if expt.get('model') != 'rrfs' or expt.get('domain') != 'conus':
         raise ValueError("POC only supports model: rrfs, domain: conus")
-    if expt.get('verification') != 'grid2obs_metar_tmp2m':
-        raise ValueError("POC only supports verification: grid2obs_metar_tmp2m")
     cycle = int(expt['cycle'])
     if not 0 <= cycle <= 23:
         raise ValueError('cycle must be between 0 and 23')
@@ -121,6 +119,20 @@ def resolve_obs_root(
 
 def spec(config_path: Path, evs_option: str | None = None):
     cfg = read_yaml(config_path)
+    
+    verification = cfg.get('verification') or {}
+    if set(verification) != {'grid2obs'}:
+        raise ValueError(
+            "Currently only verification.grid2obs is supported"
+        )
+    grid2obs = verification['grid2obs']
+    obs_types = grid2obs.get('observations', [])
+    variables = grid2obs.get('variables', [])
+    if obs_types != ['metar'] or variables != ['TMP2m']:
+        raise ValueError(
+            "Current proof of concept supports only "
+            "observations: [metar], variables: [TMP2m]"
+        )
     e = cfg['experiment']
     init, valid, fhr = time_case(e)
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', e['name']):
@@ -155,6 +167,7 @@ def spec(config_path: Path, evs_option: str | None = None):
     return dict(
         experiment=e['name'], init_date=init.strftime('%Y%m%d'), cycle=init.strftime('%H'),
         fhr=fhr, vdate=valid.strftime('%Y%m%d'), vhour=valid.strftime('%H'),
+        model=e['model'], domain=e['domain'], obs_type=obs_types[0], variable=variables[0],
         source=str(source), evs_relative=str(evs_relative),
         obs_root=str(obs_root) if obs_root else None,
         obs_file=str(obs_file) if obs_file else None,

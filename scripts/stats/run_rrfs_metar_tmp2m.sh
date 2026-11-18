@@ -31,6 +31,8 @@ keys={
   'VR_OBS_STAGE':'obs_stage_root',
   'VR_FORECAST':'forecast_staged',
   'VR_OBS':'obs_staged',
+  'VR_OBS_TYPE':'obs_type',
+  'VR_VARIABLE':'variable',
 }
 Path(sys.argv[2]).write_text(''.join(
     f'export {name}={shlex.quote(str(info[value]))}\n'
@@ -62,7 +64,7 @@ export NET=evs STEP=stats COMPONENT=cam RUN=atmos
 export VERIF_CASE=grid2obs MODELNAME=rrfs
 export DATA="$VR_RUN_DIR/work"
 export VDATE="$VR_VDATE" VHOUR="$VR_VHOUR" FHR="$(printf '%02d' "$VR_FHR")"
-export vhr="$VR_VHOUR" NEST=conus VERIF_TYPE=metar var_set_num=0
+export vhr="$VR_VHOUR" NEST=conus VERIF_TYPE="$VR_OBS_TYPE" var_set_num=0
 export COMINrrfs="$VR_FCST_STAGE" COMINobsproc="$VR_OBS_STAGE"
 export COMOUT="$VR_RUN_DIR/comout"
 export COMOUTsmall="$COMOUT/atmos.$VDATE/rrfs/grid2obs"
@@ -102,7 +104,7 @@ export FHR_GROUP_LIST=SHORT
 export FHR_START="$VR_FHR" FHR_END="$VR_FHR" FHR_INCR=1
 export FHR_END_SHORT="$VR_FHR" FHR_INCR_SHORT=1
 export SKIP_IF_OUTPUT_EXISTS=no
-export VAR_NAME=TMP2m job_name=vr_rrfs_tmp2m
+export VAR_NAME="$VR_VARIABLE" job_name=vr_rrfs_tmp2m
 export MET_PLUS_OUT="$DATA/$VERIF_CASE/METplus_output"
 export MET_CONFIG_OVERRIDES=''
 export OMP_NUM_THREADS=1
@@ -129,13 +131,13 @@ obs_nc="$MET_PLUS_OUT/metar/conus/pb2nc/prepbufr.rrfs.${VDATE}${VHOUR}.nc"
 
 # Import authoritative variable and output flag definitions from upstream EVS.
 var_env="$VR_RUN_DIR/variables.env"
-python3 - "$USHevs/cam" "$var_env" <<'PY'
+python3 - "$USHevs/cam" "$var_env" "$VAR_NAME" "$VERIF_TYPE" "$MODELNAME" <<'PY'
 import shlex, sys
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 from cam_stats_grid2obs_var_defs import generate_stats_jobs_dict
-v=generate_stats_jobs_dict['TMP2m']['metar']
-spec=v['rrfs']
+v=generate_stats_jobs_dict[sys.argv[3]][sys.argv[4]]
+spec=v[sys.argv[5]]
 entries = {
   'FCST_VAR1_NAME':spec['var1_fcst_name'],
   'FCST_VAR1_LEVELS':spec['var1_fcst_levels'],

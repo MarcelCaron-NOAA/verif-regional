@@ -3,10 +3,14 @@ experiment:
   name: rrfs_smoketest
   model: rrfs
   domain: conus
-  verification: grid2obs_metar_tmp2m
   init_date: '20261115'
   cycle: 0
   forecast_hour: 6
+
+verification:
+  grid2obs:
+    observations: [metar]
+    variables: [TMP2m]
 
 input:
   root: /lfs/h1/ops/prod/com/rrfs/v1.0
