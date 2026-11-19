@@ -54,6 +54,35 @@ def expand(path: str, relative_to: Path | None = None) -> Path:
     return resolved.resolve(strict=False)
 
 
+def requested_hours(cfg: dict) -> list[int]:
+    expt = cfg['experiment']
+
+    if 'forecast_hours' not in expt:
+        return [int(expt['forecast_hour'])]
+
+    if 'forecast_hour' in expt:
+        raise ValueError(
+            "Use either forecast_hour or forecast_hours, not both"
+        )
+
+    hours = expt['forecast_hours']
+
+    if not isinstance(hours, list) or not hours:
+        raise ValueError("forecast_hours must be a nonempty list")
+
+    if any(type(h) is not int or not 0 <= h <= 84 for h in hours):
+        raise ValueError("forecast_hours must contain integers from 0 to 84")
+
+    if len(hours) != len(set(hours)):
+        raise ValueError("Duplicate forecast hours are not allowed")
+
+    # Temporary submission limit until concurrency controls are added.
+    if len(hours) > 12:
+        raise ValueError("Prototype currently supports at most 12 forecast hours")
+
+    return sorted(hours)
+
+
 def time_case(expt: dict) -> tuple[dt.datetime, dt.datetime, int]:
     if expt.get('model') != 'rrfs' or expt.get('domain') != 'conus':
         raise ValueError("POC only supports model: rrfs, domain: conus")
@@ -117,7 +146,8 @@ def resolve_obs_root(
     return None, None, [f"Cannot auto-find obsproc file under {base_root}. Set observations.root explicitly."]
 
 
-def spec(config_path: Path, evs_option: str | None = None):
+def spec(config_path: Path, evs_option: str | None = None, 
+         fhr_override: int | None = None):
     cfg = read_yaml(config_path)
     
     verification = cfg.get('verification') or {}
@@ -135,7 +165,9 @@ def spec(config_path: Path, evs_option: str | None = None):
             "Currently supported: RRFS CONUS grid2obs, "
             "METAR, with one variable (TMP2m or DPT2m)"
         )
-    e = cfg['experiment']
+    e = dict(cfg['experiment'])
+    if fhr_override is not None:
+        e['forecast_hour'] = fhr_override
     init, valid, fhr = time_case(e)
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', e['name']):
         raise ValueError('experiment.name must contain only letters, numbers, hyphen, underscore')
@@ -393,38 +425,109 @@ def main(argv=None):
     parser.add_argument('--check-fields', action='store_true', help='Check TMP2m GRIB2 field using wgrib2, if available')
     args = parser.parse_args(argv)
     try:
-        s = spec(args.config.resolve(), args.evs_root)
-        if args.command == 'plan':
-            problems = show_plan(s, check_field=args.check_fields)
-            return 1 if problems else 0
-        else:
-            manifest_path = stage(s)
-            if args.command in ('write-job', 'submit'):
-                job = write_job(s, manifest_path)
-                if args.command == 'submit':
-                    result = subprocess.run(
-                        ['qsub', '-V', str(job)],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
+        config_path = args.config.resolve()
+        cfg = read_yaml(config_path)
+        hours = requested_hours(cfg)
 
-                    job_name, log_file = job_details(s)
+        failed = False
+        processed = 0
+        skipped = 0
 
-                    print("\nPBS job submitted")
-                    print(f"  Job ID:     {result.stdout.strip()}")
-                    print(f"  Job name:   {job_name}")
-                    print(f"  Job script: {job}")
-                    print(f"  Log:        {log_file}")
-                    print(
-                        f"  Statistics: "
-                        f"{Path(s['run_dir']) / 'work/grid2obs/METplus_output'}"
-                    )
-        return 0
-    except (ValueError, KeyError, RuntimeError, OSError, subprocess.CalledProcessError) as exc:
-        print(f'ERROR: {exc}', file=sys.stderr)
+        for hour in hours:
+            s = spec(
+                config_path,
+                args.evs_root,
+                fhr_override=hour,
+            )
+
+            print(f"\n{'=' * 50}")
+            print(f"Forecast F{hour:03d}")
+            print(f"{'=' * 50}")
+
+            if args.command == 'plan':
+                problems = show_plan(
+                    s, check_field=args.check_fields
+                )
+                failed = failed or bool(problems)
+                continue
+
+            # Missing forecast/obs inputs are common in retrospectives.
+            # Skip these tasks without stopping the others.
+            missing_input = (
+                not Path(s['source']).is_file()
+                or not s['obs_file']
+                or not Path(s['obs_file']).is_file()
+            )
+
+            if len(hours) > 1 and missing_input:
+                print(f"SKIPPED F{hour:03d}: missing input")
+                print(f"  Forecast: {s['source']}")
+                print(f"  Obs:      {s['obs_file']}")
+                skipped += 1
+                continue
+
+            try:
+                manifest_path = stage(s)
+
+                if args.command in ('write-job', 'submit'):
+                    job = write_job(s, manifest_path)
+
+                    if args.command == 'submit':
+                        result = subprocess.run(
+                            ['qsub', '-V', str(job)],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                        )
+
+                        job_name, log_file = job_details(s)
+
+                        print("\nPBS job submitted")
+                        print(f"  Job ID:     {result.stdout.strip()}")
+                        print(f"  Job name:   {job_name}")
+                        print(f"  Job script: {job}")
+                        print(f"  Log:        {log_file}")
+                        print(
+                            f"  Statistics: "
+                            f"{Path(s['run_dir']) / 'work/grid2obs/METplus_output'}"
+                        )
+
+                processed += 1
+
+            except (
+                ValueError,
+                KeyError,
+                RuntimeError,
+                OSError,
+                subprocess.CalledProcessError,
+            ) as exc:
+                print(
+                    f"ERROR F{hour:03d}: {exc}",
+                    file=sys.stderr,
+                )
+                failed = True
+
+        if args.command != 'plan':
+            print(
+                f"\nSummary: {processed} processed, "
+                f"{skipped} skipped, "
+                f"errors={'yes' if failed else 'no'}"
+            )
+
+            if processed == 0:
+                return 1
+
+        return 1 if failed else 0
+
+    except (
+        ValueError,
+        KeyError,
+        RuntimeError,
+        OSError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
 
 if __name__ == '__main__':
     sys.exit(main())
