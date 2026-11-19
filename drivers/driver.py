@@ -158,12 +158,19 @@ def spec(config_path: Path, evs_option: str | None = None,
     grid2obs = verification['grid2obs']
     obs_types = grid2obs.get('observations', [])
     variables = grid2obs.get('variables', [])
-    if obs_types != ['metar'] or variables not in (
-            ['TMP2m'], ['DPT2m']
-            ):
+    supported = {'TMP2m', 'DPT2m'}
+
+    if (
+        obs_types != ['metar']
+        or not isinstance(variables, list)
+        or not variables
+        or any(type(v) is not str or v not in supported for v in variables)
+        or len(variables) != len(set(variables))
+    ):
         raise ValueError(
-            "Currently supported: RRFS CONUS grid2obs, "
-            "METAR, with one variable (TMP2m or DPT2m)"
+            "Currently supported: RRFS CONUS METAR grid2obs "
+            "with one or more distinct variables from "
+            f"{sorted(supported)}"
         )
     e = dict(cfg['experiment'])
     if fhr_override is not None:
@@ -202,6 +209,7 @@ def spec(config_path: Path, evs_option: str | None = None,
         experiment=e['name'], init_date=init.strftime('%Y%m%d'), cycle=init.strftime('%H'),
         fhr=fhr, vdate=valid.strftime('%Y%m%d'), vhour=valid.strftime('%H'),
         model=e['model'], domain=e['domain'], obs_type=obs_types[0], variable=variables[0],
+        variables=list(variables),
         source=str(source), evs_relative=str(evs_relative),
         obs_root=str(obs_root) if obs_root else None,
         obs_file=str(obs_file) if obs_file else None,
@@ -269,7 +277,7 @@ def show_plan(s: dict, check_field: bool = False):
     print(
         f"Case:    {s['experiment']}  "
         f"{s['model'].upper()} {s['domain'].upper()} "
-        f"{s['obs_type'].upper()} {s['variable']}"
+        f"{s['obs_type'].upper()} {', '.join(s['variables'])}"
     )
     print(f"Init:    {s['init_date']} {s['cycle']}Z  F{s['fhr']:03d}")
     print(f"Valid:   {s['vdate']} {s['vhour']}Z")
@@ -283,10 +291,11 @@ def show_plan(s: dict, check_field: bool = False):
     print(f"Output:  {s['run_dir']}/work/grid2obs/METplus_output/")
     print('Steps:   stage symlinks > preprocess ADPSFC > EVS PB2NC > EVS PointStat')
     if check_field:
-        print(
-            f"{s['variable']}:   " 
-            + field_check(s['source'], s['variable'])
-        )
+        for variable in s['variables']:
+            print(
+                f"{variable}:   "
+                + field_check(s['source'], variable)
+            )
     problems = issues(s)
     if problems:
         print('\nNeeds attention:')
@@ -313,21 +322,24 @@ def stage(s: dict):
     if problems:
         raise RuntimeError('Cannot stage until required inputs exist:\n  - '+'\n  - '.join(problems))
     
-    # Perform a GRIB field-level preflight when wgrib2 is available.
-    field_status = field_check(s['source'], s['variable'])
-    if field_status.startswith(('MISSING:', 'FAILED:')):
-        raise RuntimeError(
-            f'Forecast field check failed: {field_status}'
-        )
-    if field_status.startswith('not checked'):
-        print(
-            f'WARNING: {s["variable"]} GRIB2 field not inspected: '
-            f'{field_status}'
-        )
-    else:
-        print(
-            f'Forecast {s["variable"]} GRIB2 field: {field_status}'
-        )
+    # Check every requested forecast field.
+    for variable in s['variables']:
+        field_status = field_check(s['source'], variable)
+
+        if field_status.startswith(('MISSING:', 'FAILED:')):
+            raise RuntimeError(
+                f'Forecast field check failed: {field_status}'
+            )
+
+        if field_status.startswith('not checked'):
+            print(
+                f'WARNING: {variable} GRIB2 field not inspected: '
+                f'{field_status}'
+            )
+        else:
+            print(
+                f'Forecast {variable} GRIB2 field: {field_status}'
+            )
     run = Path(s['run_dir'])
     for folder in ['input', 'jobs', 'logs', 'work']:
         (run / folder).mkdir(parents=True, exist_ok=True)
@@ -390,7 +402,7 @@ def write_job(s: dict, manifest_path: Path):
         raise ValueError('walltime must be HH:MM:SS')
     run = Path(s['run_dir'])
     job_name, log_file = job_details(s)
-    command = REPO / 'scripts' / 'stats' / 'run_rrfs_metar_tmp2m.sh'
+    command = REPO / 'scripts' / 'stats' / 'run_grid2obs.sh'
     lines = [
         '#!/usr/bin/env bash',
         f'#PBS -N {job_name}',

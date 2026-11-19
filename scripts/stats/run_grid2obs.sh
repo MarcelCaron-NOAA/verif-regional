@@ -22,6 +22,8 @@ import json, shlex, sys
 from pathlib import Path
 info=json.loads(Path(sys.argv[1]).read_text())
 keys={
+  'VR_MODEL': 'model',
+  'VR_DOMAIN': 'domain',
   'VR_EVS_ROOT':'evs_root',
   'VR_RUN_DIR':'run_dir',
   'VR_VDATE':'vdate',
@@ -34,12 +36,29 @@ keys={
   'VR_OBS_TYPE':'obs_type',
   'VR_VARIABLE':'variable',
 }
-Path(sys.argv[2]).write_text(''.join(
+exports = ''.join(
     f'export {name}={shlex.quote(str(info[value]))}\n'
-    for name,value in keys.items()))
+    for name, value in keys.items()
+)
+
+variables = info.get('variables') or [info['variable']]
+exports += (
+    f'export VR_VARIABLES='
+    f'{shlex.quote(" ".join(variables))}\n'
+)
+
+Path(sys.argv[2]).write_text(exports)
 PY
 # shellcheck disable=SC1090
 source "$meta_env"
+
+# Only the RRFS CONUS / METAR implementation is validated so far.
+if [[ "$VR_MODEL" != "rrfs" ||
+      "$VR_DOMAIN" != "conus" ||
+      "$VR_OBS_TYPE" != "metar" ]]; then
+    echo "Unsupported grid2obs combination: $VR_MODEL / $VR_DOMAIN / $VR_OBS_TYPE" >&2
+    exit 2
+fi
 
 [[ -s "$VR_FORECAST" ]] || { echo "Missing forecast: $VR_FORECAST" >&2; exit 3; }
 [[ -s "$VR_OBS" ]] || { echo "Missing obsproc input: $VR_OBS" >&2; exit 3; }
@@ -61,10 +80,10 @@ command -v run_metplus.py >/dev/null || { echo 'run_metplus.py not on PATH' >&2;
 
 export machine="${VR_MACHINE:?Machine name missing from profile}"
 export NET=evs STEP=stats COMPONENT=cam RUN=atmos
-export VERIF_CASE=grid2obs MODELNAME=rrfs
+export VERIF_CASE=grid2obs MODELNAME="$VR_MODEL"
 export DATA="$VR_RUN_DIR/work"
 export VDATE="$VR_VDATE" VHOUR="$VR_VHOUR" FHR="$(printf '%02d' "$VR_FHR")"
-export vhr="$VR_VHOUR" NEST=conus VERIF_TYPE="$VR_OBS_TYPE" var_set_num=0
+export vhr="$VR_VHOUR" NEST="$VR_DOMAIN" VERIF_TYPE="$VR_OBS_TYPE" var_set_num=0
 export COMINrrfs="$VR_FCST_STAGE" COMINobsproc="$VR_OBS_STAGE"
 export COMOUT="$VR_RUN_DIR/comout"
 export COMOUTsmall="$COMOUT/atmos.$VDATE/rrfs/grid2obs"
@@ -130,45 +149,100 @@ run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
 obs_nc="$MET_PLUS_OUT/metar/conus/pb2nc/prepbufr.rrfs.${VDATE}${VHOUR}.nc"
 [[ -s "$obs_nc" ]] || { echo "PB2NC output missing: $obs_nc" >&2; exit 7; }
 
-# Import authoritative variable and output flag definitions from upstream EVS.
-var_env="$VR_RUN_DIR/variables.env"
-python3 - "$USHevs/cam" "$var_env" "$VAR_NAME" "$VERIF_TYPE" "$MODELNAME" <<'PY'
-import shlex, sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[1])
-from cam_stats_grid2obs_var_defs import generate_stats_jobs_dict
-v=generate_stats_jobs_dict[sys.argv[3]][sys.argv[4]]
-spec=v[sys.argv[5]]
-entries = {
-  'FCST_VAR1_NAME':spec['var1_fcst_name'],
-  'FCST_VAR1_LEVELS':spec['var1_fcst_levels'],
-  'FCST_VAR1_THRESHOLDS':spec['var1_fcst_thresholds'],
-  'FCST_VAR1_OPTIONS':spec['var1_fcst_options'],
-  'OBS_VAR1_NAME':spec['var1_obs_name'],
-  'OBS_VAR1_LEVELS':spec['var1_obs_levels'],
-  'OBS_VAR1_THRESHOLDS':spec['var1_obs_thresholds'],
-  'OBS_VAR1_OPTIONS':spec['var1_obs_options'],
-  **{'OUTPUT_FLAG_'+key:value for key,value in v['output_types'].items() if key in
-    ('CTC','SL1L2','VL1L2','CNT','VCNT','MCTC')},
-}
-Path(sys.argv[2]).write_text(''.join(
-    f'export {key}={shlex.quote(str(value))}\n' for key,value in entries.items()))
-PY
-# shellcheck disable=SC1090
-source "$var_env"
 
-echo "Step 3: EVS PointStat ($MODELNAME $VAR_NAME vs $VERIF_TYPE)"
-run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
-    -c "$MET_PLUS_CONF/PointStat_fcstCAM_obsMETAR.conf"
+# One PB2NC output is shared by all requested variables.
+read -r -a requested_variables <<< "$VR_VARIABLES"
+
+if (( ${#requested_variables[@]} == 0 )); then
+    echo "No grid2obs variables requested" >&2
+    exit 8
+fi
 
 stat_root="$MET_PLUS_OUT/metar/point_stat"
 shopt -s nullglob globstar
-stat_files=("$stat_root"/**/*.stat)
-if (( ${#stat_files[@]} == 0 )); then
-    echo "PointStat reported success but produced no .stat files in $stat_root" >&2
-    exit 8
-fi
-printf 'SUCCESS: raw MET statistics:\n'
-printf '  %s\n' "${stat_files[@]}"
-echo 'Next: compare matching SL1L2 records with conventional EVS on 20261115.'
+
+for variable in "${requested_variables[@]}"; do
+    export VAR_NAME="$variable"
+    export job_name="vr_${MODELNAME}_${VAR_NAME}"
+
+    echo "=================================================="
+    echo "Running EVS PointStat: $MODELNAME $VAR_NAME / $VERIF_TYPE"
+    echo "=================================================="
+
+    # Load variable definitions directly from upstream EVS.
+    var_env="$VR_RUN_DIR/variables_${VAR_NAME}.env"
+
+    python3 - "$USHevs/cam" "$var_env" \
+        "$VAR_NAME" "$VERIF_TYPE" "$MODELNAME" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+from cam_stats_grid2obs_var_defs import generate_stats_jobs_dict
+
+variable, obs_type, model = sys.argv[3:6]
+
+try:
+    v = generate_stats_jobs_dict[variable][obs_type]
+    spec = v[model]
+except KeyError as exc:
+    raise SystemExit(
+        f"Unsupported EVS grid2obs selection: "
+        f"{variable}/{obs_type}/{model}: {exc}"
+    )
+
+entries = {
+    'FCST_VAR1_NAME': spec['var1_fcst_name'],
+    'FCST_VAR1_LEVELS': spec['var1_fcst_levels'],
+    'FCST_VAR1_THRESHOLDS': spec['var1_fcst_thresholds'],
+    'FCST_VAR1_OPTIONS': spec['var1_fcst_options'],
+    'OBS_VAR1_NAME': spec['var1_obs_name'],
+    'OBS_VAR1_LEVELS': spec['var1_obs_levels'],
+    'OBS_VAR1_THRESHOLDS': spec['var1_obs_thresholds'],
+    'OBS_VAR1_OPTIONS': spec['var1_obs_options'],
+}
+
+# Always reset output flags between variables.
+# Otherwise values from a previous variable could persist.
+for key in ('CTC', 'SL1L2', 'VL1L2', 'CNT', 'VCNT', 'MCTC'):
+    entries[f'OUTPUT_FLAG_{key}'] = (
+        v['output_types'].get(key, 'NONE')
+    )
+
+Path(sys.argv[2]).write_text(''.join(
+    f'export {key}={shlex.quote(str(value))}\n'
+    for key, value in entries.items()
+))
+PY
+
+    # shellcheck disable=SC1090
+    source "$var_env"
+
+    run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
+        -c "$MET_PLUS_CONF/PointStat_fcstCAM_obsMETAR.conf"
+
+    # Check for the requested variable and forecast hour,
+    # not just any existing STAT output.
+    stat_files=(
+        "$stat_root"/**/*_"$VAR_NAME"_OBS_f"$FHR"_*.stat
+    )
+
+    if (( ${#stat_files[@]} == 0 )); then
+        echo "ERROR: No PointStat output found for $VAR_NAME F$FHR" >&2
+        exit 8
+    fi
+
+    for stat_file in "${stat_files[@]}"; do
+        [[ -s "$stat_file" ]] || {
+            echo "ERROR: Empty STAT file: $stat_file" >&2
+            exit 8
+        }
+    done
+
+    printf 'STAT output available for %s:\n' "$VAR_NAME"
+    printf '  %s\n' "${stat_files[@]}"
+done
+
+echo "SUCCESS: grid2obs workflow completed for ${requested_variables[*]}"
 
