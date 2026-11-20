@@ -30,6 +30,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from ush.evs_catalog import discover, check_field
+from ush.task_planner import requested_hours, requested_cases
 
 MODEL_TEMPLATE = (
     'rrfs.{init_date}/{cycle}/rrfs.t{cycle}z.2dfld.3km.f{fhr:03d}.conus.grib2'
@@ -58,35 +59,6 @@ def expand(path: str, relative_to: Path | None = None) -> Path:
     if not resolved.is_absolute() and relative_to:
         resolved = relative_to / resolved
     return resolved.resolve(strict=False)
-
-
-def requested_hours(cfg: dict) -> list[int]:
-    expt = cfg['experiment']
-
-    if 'forecast_hours' not in expt:
-        return [int(expt['forecast_hour'])]
-
-    if 'forecast_hour' in expt:
-        raise ValueError(
-            "Use either forecast_hour or forecast_hours, not both"
-        )
-
-    hours = expt['forecast_hours']
-
-    if not isinstance(hours, list) or not hours:
-        raise ValueError("forecast_hours must be a nonempty list")
-
-    if any(type(h) is not int or not 0 <= h <= 84 for h in hours):
-        raise ValueError("forecast_hours must contain integers from 0 to 84")
-
-    if len(hours) != len(set(hours)):
-        raise ValueError("Duplicate forecast hours are not allowed")
-
-    # Temporary submission limit until concurrency controls are added.
-    if len(hours) > 12:
-        raise ValueError("Prototype currently supports at most 12 forecast hours")
-
-    return sorted(hours)
 
 
 def time_case(expt: dict) -> tuple[dt.datetime, dt.datetime, int]:
@@ -153,7 +125,8 @@ def resolve_obs_root(
 
 
 def spec(config_path: Path, evs_option: str | None = None, 
-         fhr_override: int | None = None):
+         fhr_override: int | None = None, init_date_override: str | None = None,
+         cycle_override: int | None = None):
     cfg = read_yaml(config_path)
     
     verification = cfg.get('verification') or {}
@@ -177,6 +150,10 @@ def spec(config_path: Path, evs_option: str | None = None,
             "list of distinct grid2obs variables"
         )
     e = dict(cfg['experiment'])
+    if init_date_override is not None:
+        e['init_date'] = init_date_override
+    if cycle_override is not None:
+        e['cycle'] = cycle_override
     if fhr_override is not None:
         e['forecast_hour'] = fhr_override
     init, valid, fhr = time_case(e)
@@ -346,7 +323,7 @@ def stage(s: dict):
 
         if field_status.startswith('not checked'):
             print(
-                f'WARNING: {variable} GRIB2 field not inspected: '
+                    f'NOTE: {variable} GRIB2 inventory check was skipped: '
                 f'{field_status}'
             )
         else:
@@ -456,6 +433,12 @@ def main(argv=None):
         '--check-fields', 
         action='store_true', 
         help='Check supported forecast GRIB2 fields using wgrib2')
+    parser.add_argument(
+        "--max-submit", 
+        type=int,
+        default=12,
+        help="Maximum PBS jobs to submit in one invocation default: 12)",
+    )
     args = parser.parse_args(argv)
     try:
         if args.command == 'list-variables':
@@ -493,21 +476,32 @@ def main(argv=None):
             )
         config_path = args.config.resolve()
         cfg = read_yaml(config_path)
-        hours = requested_hours(cfg)
-
+        cases = requested_cases(cfg)
+        if args.command == "submit":
+            if args.max_submit < 1:
+                raise ValueError("--max-submit must be positive")
+            if len(cases) > args.max_submit:
+                raise ValueError(
+                    f"Experiment contains {len(cases)} tasks, exceeding "
+                    f"the submission limit of {args.max_submit}. "
+                    "Use --max-submit to authorize a larger batch."
+                )
+    
         failed = False
         processed = 0
         skipped = 0
 
-        for hour in hours:
+        for init_date, cycle, hour in cases:
             s = spec(
                 config_path,
                 args.evs_root,
                 fhr_override=hour,
+                init_date_override=init_date,
+                cycle_override=cycle,
             )
 
             print(f"\n{'=' * 50}")
-            print(f"Forecast F{hour:03d}")
+            print(f"Init {init_date} {cycle:02d}Z / F{hour:03d}")
             print(f"{'=' * 50}")
 
             if args.command == 'plan':
@@ -525,7 +519,7 @@ def main(argv=None):
                 or not Path(s['obs_file']).is_file()
             )
 
-            if len(hours) > 1 and missing_input:
+            if len(cases) > 1 and missing_input:
                 print(f"SKIPPED F{hour:03d}: missing input")
                 print(f"  Forecast: {s['source']}")
                 print(f"  Obs:      {s['obs_file']}")

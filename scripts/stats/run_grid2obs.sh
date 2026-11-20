@@ -210,6 +210,8 @@ for key in ('CTC', 'SL1L2', 'VL1L2', 'CNT', 'VCNT', 'MCTC'):
         v['output_types'].get(key, 'NONE')
     )
 
+for key in ('FCST_VAR1_OPTIONS', 'OBS_VAR1_OPTIONS'):
+    entries[key] = entries[key].replace(r'\"', '"')
 Path(sys.argv[2]).write_text(''.join(
     f'export {key}={shlex.quote(str(value))}\n'
     for key, value in entries.items()
