@@ -24,7 +24,13 @@ try:
 except ImportError:
     sys.exit("PyYAML is required for the YAML experiment configuration (install in the EVS Python environment).")
 
+
 REPO = Path(__file__).resolve().parents[1]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+from ush.evs_catalog import discover, check_field
+
 MODEL_TEMPLATE = (
     'rrfs.{init_date}/{cycle}/rrfs.t{cycle}z.2dfld.3km.f{fhr:03d}.conus.grib2'
 )
@@ -158,19 +164,17 @@ def spec(config_path: Path, evs_option: str | None = None,
     grid2obs = verification['grid2obs']
     obs_types = grid2obs.get('observations', [])
     variables = grid2obs.get('variables', [])
-    supported = {'TMP2m', 'DPT2m'}
 
     if (
         obs_types != ['metar']
         or not isinstance(variables, list)
         or not variables
-        or any(type(v) is not str or v not in supported for v in variables)
+        or any(type(v) is not str for v in variables)
         or len(variables) != len(set(variables))
     ):
         raise ValueError(
-            "Currently supported: RRFS CONUS METAR grid2obs "
-            "with one or more distinct variables from "
-            f"{sorted(supported)}"
+            "Expected observations: [metar] and a nonempty "
+            "list of distinct grid2obs variables"
         )
     e = dict(cfg['experiment'])
     if fhr_override is not None:
@@ -193,6 +197,29 @@ def spec(config_path: Path, evs_option: str | None = None,
     run_dir = output_root / case_name
     evs_root = expand(evs_option or os.getenv('VERIF_REGIONAL_EVS_ROOT') or str(REPO / 'evs'))
     missing_evs = [x for x in REQUIRED_EVS_FILES if not (evs_root / x).is_file()]
+    catalog = discover(evs_root, e['model'], obs_types[0])
+
+    unknown = [v for v in variables if v not in catalog]
+    if unknown:
+        raise ValueError(
+            f"Variables not defined by EVS for "
+            f"{e['model']}/{obs_types[0]}: {unknown}"
+        )
+
+    blocked = [
+        (v, catalog[v]['reason'])
+        for v in variables
+        if catalog[v]['status'] == 'needs-adapter'
+    ]
+
+    if blocked:
+        details = "; ".join(
+            f"{name}: {reason}" for name, reason in blocked
+        )
+        raise ValueError(
+            f"Requested variables need additional wrapper support: "
+            f"{details}"
+        )
     experiment_env = cfg.get('environment') or {}
     machine_env = machine.get('environment') or {}
     exp_setup = experiment_env.get('setup_script') or ''
@@ -209,7 +236,7 @@ def spec(config_path: Path, evs_option: str | None = None,
         experiment=e['name'], init_date=init.strftime('%Y%m%d'), cycle=init.strftime('%H'),
         fhr=fhr, vdate=valid.strftime('%Y%m%d'), vhour=valid.strftime('%H'),
         model=e['model'], domain=e['domain'], obs_type=obs_types[0], variable=variables[0],
-        variables=list(variables),
+        variables=list(variables), variable_info={v: catalog[v] for v in variables},
         source=str(source), evs_relative=str(evs_relative),
         obs_root=str(obs_root) if obs_root else None,
         obs_file=str(obs_file) if obs_file else None,
@@ -246,31 +273,9 @@ def issues(s: dict) -> list[str]:
         errors.append(f"EVS masks directory missing: {fix_root}/masks")
     return errors
 
-def field_check(source: str, variable: str):
-    patterns = {
-        'TMP2m': ':TMP:2 m above ground:',
-        'DPT2m': ':DPT:2 m above ground:',
-    }
 
-    pattern = patterns[variable]
-    wgrib = shutil.which('wgrib2')
-
-    if not wgrib or not Path(source).is_file():
-        return 'not checked (wgrib2 unavailable or forecast missing)'
-
-    proc = subprocess.run(
-        [wgrib, source, '-match', pattern, '-s'],
-        capture_output=True,
-        text=True,
-    )
-
-    if proc.returncode != 0:
-        return (
-            f'FAILED: wgrib2 returned {proc.returncode}: '
-            + proc.stderr.strip()[:250]
-        )
-
-    return 'present' if proc.stdout.strip() else f'MISSING: {variable}'
+def field_check(source: str, variable: str, s: dict):
+    return check_field(source, s['variable_info'][variable])
 
 
 def show_plan(s: dict, check_field: bool = False):
@@ -290,13 +295,21 @@ def show_plan(s: dict, check_field: bool = False):
     print(f"Fix:     {s['fix_root']}")
     print(f"Output:  {s['run_dir']}/work/grid2obs/METplus_output/")
     print('Steps:   stage symlinks > preprocess ADPSFC > EVS PB2NC > EVS PointStat')
-    if check_field:
-        for variable in s['variables']:
-            print(
-                f"{variable}:   "
-                + field_check(s['source'], variable)
-            )
     problems = issues(s)
+
+    for variable in s['variables']:
+        info = s['variable_info'][variable]
+
+        print(f"{variable}: {info['status']}")
+
+        if check_field:
+            result = field_check(s['source'], variable, s)
+            print(f"  GRIB2: {result}")
+
+            if result.startswith(('MISSING:', 'FAILED:')):
+                problems.append(
+                    f"{variable} GRIB2 field check: {result}"
+                )
     if problems:
         print('\nNeeds attention:')
         for problem in problems:
@@ -324,7 +337,7 @@ def stage(s: dict):
     
     # Check every requested forecast field.
     for variable in s['variables']:
-        field_status = field_check(s['source'], variable)
+        field_status = field_check(s['source'], variable, s)
 
         if field_status.startswith(('MISSING:', 'FAILED:')):
             raise RuntimeError(
@@ -349,7 +362,7 @@ def stage(s: dict):
     symlink_checked(Path(s['obs_file']), staged_obs)
     manifest = {
         k: v for k, v in s.items()
-        if k not in ('machine', 'missing_evs', 'obs_warnings')
+        if k not in ('machine', 'missing_evs', 'obs_warnings', 'variable_info')
     }
     manifest['forecast_staged'] = str(staged_fcst)
     manifest['obs_staged'] = str(staged_obs)
@@ -431,12 +444,53 @@ def write_job(s: dict, manifest_path: Path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['plan', 'stage', 'write-job', 'submit'])
-    parser.add_argument('config', type=Path)
+    parser.add_argument(
+        'command',
+        choices=['plan', 'stage', 'write-job', 'submit', 'list-variables']
+    )
+    parser.add_argument('config', type=Path, nargs='?')
+    parser.add_argument('--model', default='rrfs')
+    parser.add_argument('--obs', default='metar')
     parser.add_argument('--evs-root', help='Use existing EVS tree (e.g. extracted zip) instead of ./evs')
-    parser.add_argument('--check-fields', action='store_true', help='Check TMP2m GRIB2 field using wgrib2, if available')
+    parser.add_argument(
+        '--check-fields', 
+        action='store_true', 
+        help='Check supported forecast GRIB2 fields using wgrib2')
     args = parser.parse_args(argv)
     try:
+        if args.command == 'list-variables':
+            evs_root = expand(
+                args.evs_root
+                or os.getenv('VERIF_REGIONAL_EVS_ROOT')
+                or str(REPO / 'evs')
+            )
+
+            catalog = discover(
+                evs_root, args.model, args.obs
+            )
+
+            print(f"EVS: {evs_root}")
+            print(f"Model: {args.model}  Observations: {args.obs}")
+            print()
+            print(
+                f"{'Variable':<20} {'Status':<18} Notes"
+            )
+            print("-" * 75)
+
+            for name, info in catalog.items():
+                print(
+                    f"{name:<20} "
+                    f"{info['status']:<18} "
+                    f"{info['reason']}"
+                )
+
+            print(f"\n{len(catalog)} EVS-defined variables")
+            return 0
+
+        if args.config is None:
+            parser.error(
+                f"Configuration YAML required for {args.command}"
+            )
         config_path = args.config.resolve()
         cfg = read_yaml(config_path)
         hours = requested_hours(cfg)
