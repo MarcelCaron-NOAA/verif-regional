@@ -30,7 +30,9 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from ush.evs_catalog import discover, check_field
+from ush.model_profiles import get_staging_template, validate_member
 from ush.task_planner import requested_hours, requested_cases
+from ush.task_state import ensure_safe_run, record_submission
 
 MODEL_TEMPLATE = (
     'rrfs.{init_date}/{cycle}/rrfs.t{cycle}z.2dfld.3km.f{fhr:03d}.conus.grib2'
@@ -38,7 +40,6 @@ MODEL_TEMPLATE = (
 REQUIRED_EVS_FILES = [
     'ush/cam/cam_stats_grid2obs_preprocess_prepbufr.py',
     'ush/cam/cam_stats_grid2obs_var_defs.py',
-    'parm/evs_config/cam/config.evs.prod.stats.cam.atmos.grid2obs.rrfs',
     'parm/metplus_config/stats/cam/grid2obs/PB2NC_obsMETAR.conf',
     'parm/metplus_config/stats/cam/grid2obs/PointStat_fcstCAM_obsMETAR.conf',
     'parm/metplus_config/machine.conf',
@@ -62,8 +63,11 @@ def expand(path: str, relative_to: Path | None = None) -> Path:
 
 
 def time_case(expt: dict) -> tuple[dt.datetime, dt.datetime, int]:
-    if expt.get('model') != 'rrfs' or expt.get('domain') != 'conus':
-        raise ValueError("POC only supports model: rrfs, domain: conus")
+    if expt.get("model") not in ("rrfs", "hrrr", "rrfsmem"):
+        raise ValueError("Unsupported EVS model profile")
+
+    if expt.get("domain") != "conus":
+        raise ValueError("Only CONUS is currently supported")
     cycle = int(expt['cycle'])
     if not 0 <= cycle <= 23:
         raise ValueError('cycle must be between 0 and 23')
@@ -77,16 +81,18 @@ def time_case(expt: dict) -> tuple[dt.datetime, dt.datetime, int]:
     return init, valid, fhr
 
 
-def source_paths(config: dict, initial: dt.datetime, valid: dt.datetime, fhr: int):
+def source_paths(config: dict, initial: dt.datetime, valid: dt.datetime, 
+                 fhr: int, profile="rrfs", member=None):
     inp = config['input']
     root = expand(inp['root'])
     fields = dict(init_date=initial.strftime('%Y%m%d'), cycle=initial.strftime('%H'),
                   fhr=fhr, valid_date=valid.strftime('%Y%m%d'),
-                  valid_hour=valid.strftime('%H'))
-    template = inp.get('template', MODEL_TEMPLATE)
+                  valid_hour=valid.strftime('%H'), member=member)
+    staging_template = get_staging_template(profile)
+    template = inp.get('template', staging_template)
     try:
         rel_src = template.format(**fields)
-        rel_evs = MODEL_TEMPLATE.format(**fields)
+        rel_evs = staging_template.format(**fields)
     except (ValueError, KeyError) as exc:
         raise ValueError(f'Invalid input template: {exc}') from exc
     source = expand(rel_src, root)
@@ -150,6 +156,54 @@ def spec(config_path: Path, evs_option: str | None = None,
             "list of distinct grid2obs variables"
         )
     e = dict(cfg['experiment'])
+    
+    if 'model' in cfg and 'forecast' in cfg:
+        raise ValueError(
+            "Use model: or forecast:, not both. "
+            "The preferred syntax is model:"
+        )
+
+    model_cfg = cfg.get('model', cfg.get('forecast', {}))
+
+    if not isinstance(model_cfg, dict):
+        raise ValueError("model must be a YAML mapping")
+
+    profile = model_cfg.get(
+        'verification_profile', e.get('model')
+    )
+    model_id = model_cfg.get('id', profile)
+
+    if not isinstance(profile, str) or not profile:
+        raise ValueError(
+            "Set model.verification_profile (e.g. rrfs)"
+        )
+
+    if (
+        'model' in e
+        and 'verification_profile' in model_cfg
+        and e['model'] != profile
+    ):
+        raise ValueError(
+            "experiment.model conflicts with "
+            "model.verification_profile. "
+            "Remove experiment.model from the YAML."
+        )
+
+    if (
+        not isinstance(model_id, str)
+        or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', model_id)
+    ):
+        raise ValueError(
+            "model.id must start with a letter and contain "
+            "only letters, numbers, and underscores"
+        )
+
+    # Internal compatibility with existing EVS execution logic.
+    e['model'] = profile
+    forecast_id = model_id
+
+    member = validate_member(profile, model_cfg.get("member"))
+
     if init_date_override is not None:
         e['init_date'] = init_date_override
     if cycle_override is not None:
@@ -159,7 +213,9 @@ def spec(config_path: Path, evs_option: str | None = None,
     init, valid, fhr = time_case(e)
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', e['name']):
         raise ValueError('experiment.name must contain only letters, numbers, hyphen, underscore')
-    source, evs_relative = source_paths(cfg, init, valid, fhr)
+    source, evs_relative = source_paths(
+        cfg, init, valid, fhr, profile=profile, member=member
+    )
     machine_cfg = expand(
         cfg['machine']['profile'], config_path.parent
     )
@@ -212,7 +268,8 @@ def spec(config_path: Path, evs_option: str | None = None,
     return dict(
         experiment=e['name'], init_date=init.strftime('%Y%m%d'), cycle=init.strftime('%H'),
         fhr=fhr, vdate=valid.strftime('%Y%m%d'), vhour=valid.strftime('%H'),
-        model=e['model'], domain=e['domain'], obs_type=obs_types[0], variable=variables[0],
+        model=e['model'], forecast_id=forecast_id, member=member, 
+        domain=e['domain'], obs_type=obs_types[0], variable=variables[0],
         variables=list(variables), variable_info={v: catalog[v] for v in variables},
         source=str(source), evs_relative=str(evs_relative),
         obs_root=str(obs_root) if obs_root else None,
@@ -256,22 +313,27 @@ def field_check(source: str, variable: str, s: dict):
 
 
 def show_plan(s: dict, check_field: bool = False):
+    print(f"Case:     {s['experiment']}")
     print(
-        f"Case:    {s['experiment']}  "
-        f"{s['model'].upper()} {s['domain'].upper()} "
-        f"{s['obs_type'].upper()} {', '.join(s['variables'])}"
+        f"Model:    {s['forecast_id']} "
+        f"(EVS profile: {s['model']})"
     )
-    print(f"Init:    {s['init_date']} {s['cycle']}Z  F{s['fhr']:03d}")
-    print(f"Valid:   {s['vdate']} {s['vhour']}Z")
-    print(f"Source:  {s['source']}")
-    print(f"Obs:     {s['obs_file'] or '(unresolved)'}")
-    print(f"Staging: {s['run_dir']}/input/{s['evs_relative']}")
-    print(f"EVS:     {s['evs_root']}")
-    print(f"Machine: {s['machine'].get('name', 'unknown')}")
-    print(f"Env:     {s['env_setup']}")
-    print(f"Fix:     {s['fix_root']}")
-    print(f"Output:  {s['run_dir']}/work/grid2obs/METplus_output/")
-    print('Steps:   stage symlinks > preprocess ADPSFC > EVS PB2NC > EVS PointStat')
+    print(
+        f"Verify:   {s['domain'].upper()} "
+        f"{s['obs_type'].upper()} "
+        f"{', '.join(s['variables'])}"
+    )
+    print(f"Init:     {s['init_date']} {s['cycle']}Z  F{s['fhr']:03d}")
+    print(f"Valid:    {s['vdate']} {s['vhour']}Z")
+    print(f"Source:   {s['source']}")
+    print(f"Obs:      {s['obs_file'] or '(unresolved)'}")
+    print(f"Staging:  {s['run_dir']}/input/{s['evs_relative']}")
+    print(f"EVS:      {s['evs_root']}")
+    print(f"Machine:  {s['machine'].get('name', 'unknown')}")
+    print(f"Env:      {s['env_setup']}")
+    print(f"Fix:      {s['fix_root']}")
+    print(f"Output:   {s['run_dir']}/work/grid2obs/METplus_output/")
+    print('Steps:    stage symlinks > preprocess ADPSFC > EVS PB2NC > EVS PointStat')
     problems = issues(s)
 
     for variable in s['variables']:
@@ -527,6 +589,7 @@ def main(argv=None):
                 continue
 
             try:
+                ensure_safe_run(s)
                 manifest_path = stage(s)
 
                 if args.command in ('write-job', 'submit'):
@@ -540,13 +603,25 @@ def main(argv=None):
                             text=True,
                         )
 
+                        job_id = result.stdout.strip()
                         job_name, log_file = job_details(s)
 
                         print("\nPBS job submitted")
-                        print(f"  Job ID:     {result.stdout.strip()}")
+                        print(f"  Job ID:     {job_id}")
                         print(f"  Job name:   {job_name}")
                         print(f"  Job script: {job}")
                         print(f"  Log:        {log_file}")
+                        try:
+                            submission_file = record_submission(
+                                s, job_id, job_name, log_file
+                            )
+                        except OSError as exc:
+                            raise RuntimeError(
+                                f"PBS job {job_id} WAS submitted, but its "
+                                f" submission record could not be written: {exc}. "
+                                f"Do not submit it again without checking PBS."
+                            ) from exc
+                        print(f"  Submission: {submission_file}")
                         print(
                             f"  Statistics: "
                             f"{Path(s['run_dir']) / 'work/grid2obs/METplus_output'}"
@@ -567,13 +642,17 @@ def main(argv=None):
                 )
                 failed = True
 
+        action_labels = {
+            "stage": "staged",
+            "write-job": "job_written",
+            "submit": "submitted",
+        }
         if args.command != 'plan':
             print(
-                f"\nSummary: {processed} processed, "
+                f"\nSummary: {processed} {action_labels[args.command]}, "
                 f"{skipped} skipped, "
-                f"errors={'yes' if failed else 'no'}"
+                f"submission/planning errors={'yes' if failed else 'no'}"
             )
-
             if processed == 0:
                 return 1
 

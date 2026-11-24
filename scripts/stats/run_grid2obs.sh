@@ -23,6 +23,8 @@ from pathlib import Path
 info=json.loads(Path(sys.argv[1]).read_text())
 keys={
   'VR_MODEL': 'model',
+  'VR_FORECAST_ID': 'forecast_id',
+  'VR_MEMBER': 'member',
   'VR_DOMAIN': 'domain',
   'VR_EVS_ROOT':'evs_root',
   'VR_RUN_DIR':'run_dir',
@@ -52,11 +54,17 @@ PY
 # shellcheck disable=SC1090
 source "$meta_env"
 
-# Only the RRFS CONUS / METAR implementation is validated so far.
-if [[ "$VR_MODEL" != "rrfs" ||
-      "$VR_DOMAIN" != "conus" ||
+case "$VR_MODEL" in rrfs|hrrr|rrfsmem) ;;
+    *)
+        echo "Unsupported EVS profile: $VR_MODEL" >&2
+        exit 2
+        ;;
+esac
+
+# Only the CONUS / METAR implementation is validated so far.
+if [[ "$VR_DOMAIN" != "conus" ||
       "$VR_OBS_TYPE" != "metar" ]]; then
-    echo "Unsupported grid2obs combination: $VR_MODEL / $VR_DOMAIN / $VR_OBS_TYPE" >&2
+    echo "Unsupported grid2obs combination: $VR_DOMAIN / $VR_OBS_TYPE" >&2
     exit 2
 fi
 
@@ -84,7 +92,12 @@ export VERIF_CASE=grid2obs MODELNAME="$VR_MODEL"
 export DATA="$VR_RUN_DIR/work"
 export VDATE="$VR_VDATE" VHOUR="$VR_VHOUR" FHR="$(printf '%02d' "$VR_FHR")"
 export vhr="$VR_VHOUR" NEST="$VR_DOMAIN" VERIF_TYPE="$VR_OBS_TYPE" var_set_num=0
-export COMINrrfs="$VR_FCST_STAGE" COMINobsproc="$VR_OBS_STAGE"
+export COMINrrfs="$VR_FCST_STAGE" 
+export COMINhrrr="$VR_FCST_STAGE"
+export COMINobsproc="$VR_OBS_STAGE"
+if [[ "$VR_MODEL" == "rrfsmem" ]]; then
+    export mem="$VR_MEMBER"
+fi
 export COMOUT="$VR_RUN_DIR/comout"
 export COMOUTsmall="$COMOUT/atmos.$VDATE/rrfs/grid2obs"
 export MET_PLUS_CONF="$PARMevs/metplus_config/stats/cam/grid2obs"
@@ -94,12 +107,12 @@ cd "$DATA"
 
 # Source upstream configuration to obtain the exact operational RRFS input
 # template, masks, grid, observation type and METplus settings.
-config="$PARMevs/evs_config/cam/config.evs.prod.stats.cam.atmos.grid2obs.rrfs"
-# shellcheck disable=SC1090
-source "$config"
-[[ "$MODEL_INPUT_TEMPLATE" == *'2dfld.3km.'* ]] || {
-    echo 'EVS input template changed; review verif-regional staging adapter.' >&2; exit 5;
+config="$PARMevs/evs_config/cam/config.evs.prod.stats.cam.atmos.grid2obs.${VR_MODEL}"
+[[ -f "$config" ]] || {
+    echo "Missing EVS profile configuration: $config" >&2
+    exit 5
 }
+source "$config"
 # Verify that EVS's live template resolves to exactly our staged file.
 resolved_fcst="$(python3 -c 'import cam_util as c; import os; print(c.get_cam_fcst_file_path(
     VERIF_CASE="grid2obs", job_type="generate", COMINfcst=os.environ["COMINfcst"],
@@ -130,7 +143,7 @@ export MET_CONFIG_OVERRIDES=''
 export OMP_NUM_THREADS=1
 
 # CAM's existing observation preprocessing: rrfs prepbufr -> ADPSFC subset.
-mkdir -p "$DATA/grid2obs/data/rrfs/tmp" "$DATA/grid2obs/data/metar/prepbufr"
+mkdir -p "$DATA/grid2obs/data/${VR_MODEL}/tmp" "$DATA/grid2obs/data/metar/prepbufr"
 mkdir -p "$MET_PLUS_OUT/metar/conus/pb2nc" \
          "$MET_PLUS_OUT/metar/conus/out/confs" \
          "$MET_PLUS_OUT/metar/conus/out/logs" \
@@ -148,7 +161,11 @@ run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
     -c "$MET_PLUS_CONF/PB2NC_obsMETAR.conf"
 obs_nc="$MET_PLUS_OUT/metar/conus/pb2nc/prepbufr.rrfs.${VDATE}${VHOUR}.nc"
 [[ -s "$obs_nc" ]] || { echo "PB2NC output missing: $obs_nc" >&2; exit 7; }
+# Observation preprocessing used the EVS profile.
+# PointStat now uses the developer's forecast identity.
+export MODELNAME="$VR_FORECAST_ID"
 
+echo "Forecast: $MODELNAME (EVS profile: $VR_MODEL)"
 
 # One PB2NC output is shared by all requested variables.
 read -r -a requested_variables <<< "$VR_VARIABLES"
@@ -173,7 +190,7 @@ for variable in "${requested_variables[@]}"; do
     var_env="$VR_RUN_DIR/variables_${VAR_NAME}.env"
 
     python3 - "$USHevs/cam" "$var_env" \
-        "$VAR_NAME" "$VERIF_TYPE" "$MODELNAME" <<'PY'
+        "$VAR_NAME" "$VERIF_TYPE" "$VR_MODEL" <<'PY'
 import shlex
 import sys
 from pathlib import Path

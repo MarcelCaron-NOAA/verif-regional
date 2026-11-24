@@ -49,8 +49,8 @@ def discover(evs_root, model="rrfs", obs_type="metar"):
 
         reason = ""
 
-        if (model, obs_type) != ("rrfs", "metar"):
-            reason = "Wrapper currently supports RRFS/METAR only"
+        if (model not in ("rrfs", "hrrr", "rrfsmem") or obs_type != "metar"):
+            reason = "Wrapper currently supports rrfs/hrrr/rrfsmem and METAR only"
         elif (
             "ceiling_grib_field" in definition
             or "surface_grib_field" in definition
