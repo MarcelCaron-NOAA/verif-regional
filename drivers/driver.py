@@ -229,7 +229,15 @@ def spec(config_path: Path, evs_option: str | None = None,
     case_name = f"{e['name']}_{init:%Y%m%d%H}_f{fhr:03d}"
     run_dir = output_root / case_name
     evs_root = expand(evs_option or os.getenv('VERIF_REGIONAL_EVS_ROOT') or str(REPO / 'evs'))
-    missing_evs = [x for x in REQUIRED_EVS_FILES if not (evs_root / x).is_file()]
+    required_evs_files = REQUIRED_EVS_FILES + [
+        'parm/evs_config/cam/'
+        f'config.evs.prod.stats.cam.atmos.grid2obs.{profile}'
+    ]
+
+    missing_evs = [
+        x for x in required_evs_files
+        if not (evs_root / x).is_file()
+    ]
     catalog = discover(evs_root, e['model'], obs_types[0])
 
     unknown = [v for v in variables if v not in catalog]
@@ -276,7 +284,7 @@ def spec(config_path: Path, evs_option: str | None = None,
         obs_file=str(obs_file) if obs_file else None,
         obs_relative=f'rrfs.{valid:%Y%m%d}/rrfs.t{valid:%H}z.prepbufr.tm00',
         obs_warnings=obs_warnings, evs_root=str(evs_root), missing_evs=missing_evs,
-        run_dir=str(run_dir),
+        required_evs_files=required_evs_files, run_dir=str(run_dir),
         env_setup=str(expand(env_setup, env_setup_base)) if env_setup else '',
         fix_root=str(expand(fix_root, fix_root_base)) if fix_root else '',
         machine=machine, machine_config=str(machine_cfg),
@@ -409,7 +417,7 @@ def stage(s: dict):
     manifest['obs_stage_root'] = str(run / 'input' / 'obsproc')
     manifest['evs_fingerprints'] = {
         x: hashlib.sha256((Path(s['evs_root']) / x).read_bytes()).hexdigest()
-        for x in REQUIRED_EVS_FILES
+        for x in s['required_evs_files']
     }
     git_sha = None
     if (Path(s['evs_root']) / '.git').exists():
