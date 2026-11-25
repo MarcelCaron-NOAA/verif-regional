@@ -39,6 +39,7 @@ keys={
   'VR_OBS':'obs_staged',
   'VR_OBS_TYPE':'obs_type',
   'VR_VARIABLE':'variable',
+  'VR_VAR_SET_NUM':'var_set_num',
 }
 exports = ''.join(
     f'export {name}={shlex.quote(str(info[value]))}\n'
@@ -65,7 +66,8 @@ esac
 
 # Only the CONUS / METAR implementation is validated so far.
 if [[ "$VR_DOMAIN" != "conus" ||
-      "$VR_OBS_TYPE" != "metar" ]]; then
+      "$VR_OBS_TYPE" != "metar" &&
+      "$VR_OBS_TYPE" != "raob" ]]; then
     echo "Unsupported grid2obs combination: $VR_DOMAIN / $VR_OBS_TYPE" >&2
     exit 2
 fi
@@ -93,7 +95,8 @@ export NET=evs STEP=stats COMPONENT=cam RUN=atmos
 export VERIF_CASE=grid2obs MODELNAME="$VR_MODEL"
 export DATA="$VR_RUN_DIR/work"
 export VDATE="$VR_VDATE" VHOUR="$VR_VHOUR" FHR="$(printf '%02d' "$VR_FHR")"
-export vhr="$VR_VHOUR" NEST="$VR_DOMAIN" VERIF_TYPE="$VR_OBS_TYPE" var_set_num=0
+export vhr="$VR_VHOUR" NEST="$VR_DOMAIN" VERIF_TYPE="$VR_OBS_TYPE" 
+export var_set_num="$VR_VAR_SET_NUM"
 export COMINrrfs="$VR_FCST_STAGE" 
 export COMINhrrr="$VR_FCST_STAGE"
 export COMINobsproc="$VR_OBS_STAGE"
@@ -114,6 +117,7 @@ config="$PARMevs/evs_config/cam/config.evs.prod.stats.cam.atmos.grid2obs.${VR_MO
     echo "Missing EVS profile configuration: $config" >&2
     exit 5
 }
+echo "EVS variable set: $var_set_num"
 source "$config"
 # Verify that EVS's live template resolves to exactly our staged file.
 resolved_fcst="$(python3 -c 'import cam_util as c; import os; print(c.get_cam_fcst_file_path(
@@ -144,25 +148,50 @@ export MET_PLUS_OUT="$DATA/$VERIF_CASE/METplus_output"
 export MET_CONFIG_OVERRIDES=''
 export OMP_NUM_THREADS=1
 
-# CAM's existing observation preprocessing: rrfs prepbufr -> ADPSFC subset.
-mkdir -p "$DATA/grid2obs/data/${VR_MODEL}/tmp" "$DATA/grid2obs/data/metar/prepbufr"
-mkdir -p "$MET_PLUS_OUT/metar/conus/pb2nc" \
-         "$MET_PLUS_OUT/metar/conus/out/confs" \
-         "$MET_PLUS_OUT/metar/conus/out/logs" \
-         "$MET_PLUS_OUT/metar/point_stat" \
-         "$MET_PLUS_OUT/metar/out/confs" \
-         "$MET_PLUS_OUT/metar/out/logs"
 
-echo "Step 1: upstream CAM ADPSFC subset preprocessing"
+# EVS observation preprocessing for METAR or RAOB.
+obs_dir="$DATA/grid2obs/data/$VERIF_TYPE/prepbufr"
+met_obs_dir="$MET_PLUS_OUT/$VERIF_TYPE/$NEST"
+
+mkdir -p "$DATA/grid2obs/data/${VR_MODEL}/tmp" "$obs_dir"
+mkdir -p "$met_obs_dir/pb2nc" \
+         "$met_obs_dir/out/confs" \
+         "$met_obs_dir/out/logs" \
+         "$MET_PLUS_OUT/$VERIF_TYPE/point_stat" \
+         "$MET_PLUS_OUT/$VERIF_TYPE/out/confs" \
+         "$MET_PLUS_OUT/$VERIF_TYPE/out/logs"
+
+if [[ "$VERIF_TYPE" == "raob" ]]; then
+    subset="ADPUPA"
+    prep_name="gdas.t${VHOUR}z.prepbufr"
+    obs_nc_name="prepbufr.gfs.${VDATE}${VHOUR}.nc"
+    pb2nc_conf="PB2NC_obsRAOB.conf"
+else
+    subset="ADPSFC"
+    prep_name="rrfs.t${VHOUR}z.prepbufr.tm00"
+    obs_nc_name="prepbufr.rrfs.${VDATE}${VHOUR}.nc"
+    pb2nc_conf="PB2NC_obsMETAR.conf"
+fi
+
+echo "Step 1: EVS $subset PrepBUFR preprocessing"
 python3 "$USHevs/cam/cam_stats_grid2obs_preprocess_prepbufr.py"
-prepbufr="$DATA/grid2obs/data/metar/prepbufr/rrfs.t${VHOUR}z.prepbufr.tm00"
-[[ -s "$prepbufr" ]] || { echo "Preprocessed ADPSFC file missing: $prepbufr" >&2; exit 6; }
 
-echo "Step 2: upstream METplus PB2NC configuration"
+prepbufr="$obs_dir/$prep_name"
+[[ -s "$prepbufr" ]] || {
+    echo "ERROR: Preprocessed $subset file missing: $prepbufr" >&2
+    exit 6
+}
+
+echo "Step 2: EVS PB2NC for $VERIF_TYPE"
 run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
-    -c "$MET_PLUS_CONF/PB2NC_obsMETAR.conf"
-obs_nc="$MET_PLUS_OUT/metar/conus/pb2nc/prepbufr.rrfs.${VDATE}${VHOUR}.nc"
-[[ -s "$obs_nc" ]] || { echo "PB2NC output missing: $obs_nc" >&2; exit 7; }
+    -c "$MET_PLUS_CONF/$pb2nc_conf"
+
+obs_nc="$met_obs_dir/pb2nc/$obs_nc_name"
+[[ -s "$obs_nc" ]] || {
+    echo "ERROR: PB2NC output missing: $obs_nc" >&2
+    exit 7
+}
+
 # Observation preprocessing used the EVS profile.
 # PointStat now uses the developer's forecast identity.
 export MODELNAME="$VR_FORECAST_ID"
@@ -177,7 +206,7 @@ if (( ${#requested_variables[@]} == 0 )); then
     exit 8
 fi
 
-stat_root="$MET_PLUS_OUT/metar/point_stat"
+stat_root="$MET_PLUS_OUT/$VERIF_TYPE/point_stat"
 shopt -s nullglob globstar
 
 for variable in "${requested_variables[@]}"; do
@@ -329,7 +358,18 @@ PY
 
     point_conf="PointStat_fcstCAM_obsMETAR.conf"
 
-    if [[ "$VAR_NAME" == "CEILING" ]]; then
+    
+    if [[ "$VERIF_TYPE" == "raob" ]]; then
+        if [[ -n "${FCST_VAR2_NAME:-}" ]]; then
+            point_conf="PointStat_fcstCAM_obsRAOB_VAR2.conf"
+        else
+            point_conf="PointStat_fcstCAM_obsRAOB.conf"
+        fi
+
+        run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
+            -c "$MET_PLUS_CONF/$point_conf"
+
+    elif [[ "$VAR_NAME" == "CEILING" ]]; then
         run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
             -c "$MET_PLUS_CONF/$point_conf" \
             -c "$MET_PLUS_CONF/PointStat_fcstCAM_obsMETAR_CEILING.conf"

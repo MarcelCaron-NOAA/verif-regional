@@ -30,7 +30,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from ush.evs_catalog import discover, check_field
-from ush.model_profiles import get_staging_template, validate_member
+from ush.model_profiles import get_staging_template, get_var_set_num, validate_member
 from ush.task_planner import requested_hours, requested_cases
 from ush.task_state import ensure_safe_run, record_submission
 
@@ -63,7 +63,7 @@ def expand(path: str, relative_to: Path | None = None) -> Path:
     return resolved.resolve(strict=False)
 
 
-def time_case(expt: dict) -> tuple[dt.datetime, dt.datetime, int]:
+def time_case(expt: dict, obs_type="metar") -> tuple[dt.datetime, dt.datetime, int]:
     if expt.get("model") not in ("rrfs", "hrrr", "rrfsmem"):
         raise ValueError("Unsupported EVS model profile")
 
@@ -77,19 +77,29 @@ def time_case(expt: dict) -> tuple[dt.datetime, dt.datetime, int]:
         raise ValueError('forecast_hour must be between 0 and 84')
     init = dt.datetime.strptime(str(expt['init_date']), '%Y%m%d').replace(hour=cycle)
     valid = init + dt.timedelta(hours=fhr)
-    if valid.hour not in (0, 3, 6, 9, 12, 15, 18, 21):
-        raise ValueError('This POC only supports the existing RRFS METAR 3-hourly valid times')
+    if obs_type == "raob":
+        valid_hours = (0, 6, 12, 18)
+    else:
+        valid_hours = (0, 3, 6, 9, 12, 15, 18, 21)
+    if valid.hour not in valid_hours:
+        raise ValueError(
+            f"{obs_type.upper()} verification requires valid hours "
+            f"{', '.join(f'{h:02d}Z' for h in valid_hours)}"
+        )
     return init, valid, fhr
 
 
 def source_paths(config: dict, initial: dt.datetime, valid: dt.datetime, 
-                 fhr: int, profile="rrfs", member=None):
+                 fhr: int, profile="rrfs", member=None, obs_type="metar",
+                 var_set_num=0):
     inp = config['input']
     root = expand(inp['root'])
     fields = dict(init_date=initial.strftime('%Y%m%d'), cycle=initial.strftime('%H'),
                   fhr=fhr, valid_date=valid.strftime('%Y%m%d'),
                   valid_hour=valid.strftime('%H'), member=member)
-    staging_template = get_staging_template(profile)
+    staging_template = get_staging_template(
+        profile, obs_type, var_set_num
+    )
     template = inp.get('template', staging_template)
     try:
         rel_src = template.format(**fields)
@@ -102,12 +112,28 @@ def source_paths(config: dict, initial: dt.datetime, valid: dt.datetime,
     return source, Path(rel_evs)
 
 
+
+def obs_relative_path(valid, obs_type):
+    if obs_type == "metar":
+        return (
+            f"rrfs.{valid:%Y%m%d}/"
+            f"rrfs.t{valid:%H}z.prepbufr.tm00"
+        )
+    if obs_type == "raob":
+        return (
+            f"gdas.{valid:%Y%m%d}/{valid:%H}/atmos/"
+            f"gdas.t{valid:%H}z.prepbufr"
+        )
+    raise ValueError(f"Unsupported observations: {obs_type}")
+
+
 def resolve_obs_root(
     value: str, 
     valid: dt.datetime,
     auto_root: str | None = None,
+    obs_type="metar",
 ):
-    rel = f'rrfs.{valid:%Y%m%d}/rrfs.t{valid:%H}z.prepbufr.tm00'
+    rel = obs_relative_path(valid, obs_type)
     if value.strip().lower() != 'auto':
         base = expand(value)
         return base, base / rel, []
@@ -125,7 +151,11 @@ def resolve_obs_root(
     # Resolve unique available paths without silently choosing an arbitrary version.
     found = sorted({p for p in candidates if p.is_file()})
     if len(found) == 1:
-        return found[0].parents[1], found[0], []
+        return (
+            found[0].parents[len(Path(rel).parts) - 1], 
+            found[0], 
+            [],
+        )
     if len(found) > 1:
         return None, None, [f"Multiple obsproc versions found: {', '.join(map(str, found))}. Set observations.root explicitly."]
     return None, None, [f"Cannot auto-find obsproc file under {base_root}. Set observations.root explicitly."]
@@ -146,14 +176,14 @@ def spec(config_path: Path, evs_option: str | None = None,
     variables = grid2obs.get('variables', [])
 
     if (
-        obs_types != ['metar']
+        obs_types not in (['metar'], ['raob'])
         or not isinstance(variables, list)
         or not variables
         or any(type(v) is not str for v in variables)
         or len(variables) != len(set(variables))
     ):
         raise ValueError(
-            "Expected observations: [metar] and a nonempty "
+            "Expected observations: [metar] or [raob] and a nonempty "
             "list of distinct grid2obs variables"
         )
     e = dict(cfg['experiment'])
@@ -205,17 +235,37 @@ def spec(config_path: Path, evs_option: str | None = None,
 
     member = validate_member(profile, model_cfg.get("member"))
 
+    
+    var_sets = {
+        variable: get_var_set_num(
+            profile, obs_types[0], variable
+        )
+        for variable in variables
+    }
+
+    required_sets = set(var_sets.values())
+
+    if len(required_sets) != 1:
+        raise ValueError(
+            "Requested variables require multiple forecast "
+            "products. Mixed-product staging is not yet "
+            "supported; use separate experiments for now."
+        )
+
+    var_set_num = required_sets.pop()
+
     if init_date_override is not None:
         e['init_date'] = init_date_override
     if cycle_override is not None:
         e['cycle'] = cycle_override
     if fhr_override is not None:
         e['forecast_hour'] = fhr_override
-    init, valid, fhr = time_case(e)
+    init, valid, fhr = time_case(e, obs_types[0])
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', e['name']):
         raise ValueError('experiment.name must contain only letters, numbers, hyphen, underscore')
     source, evs_relative = source_paths(
-        cfg, init, valid, fhr, profile=profile, member=member
+        cfg, init, valid, fhr, profile=profile, member=member, 
+        obs_type=obs_types[0], var_set_num=var_set_num
     )
     machine_cfg = expand(
         cfg['machine']['profile'], config_path.parent
@@ -225,6 +275,7 @@ def spec(config_path: Path, evs_option: str | None = None,
         cfg['observations'].get('root', 'auto'), 
         valid,
         (machine.get('paths') or {}).get('obsproc_root'),
+        obs_type=obs_types[0],
     )
     output_root = expand(cfg['output']['root'])
     case_name = f"{e['name']}_{init:%Y%m%d%H}_f{fhr:03d}"
@@ -248,6 +299,15 @@ def spec(config_path: Path, evs_option: str | None = None,
             "parm/metplus_config/stats/cam/grid2obs/"
             "PointStat_fcstCAM_obsMETAR_PTYPE.conf",
             "ush/cam/cam_stats_grid2obs_create_merged_ptype.py",
+        ])
+    if obs_types[0] == "raob":
+        required_evs_files.extend([
+            "parm/metplus_config/stats/cam/grid2obs/"
+            "PB2NC_obsRAOB.conf",
+            "parm/metplus_config/stats/cam/grid2obs/"
+            "PointStat_fcstCAM_obsRAOB.conf",
+            "parm/metplus_config/stats/cam/grid2obs/"
+            "PointStat_fcstCAM_obsRAOB_VAR2.conf",
         ])
 
     missing_evs = [
@@ -295,10 +355,10 @@ def spec(config_path: Path, evs_option: str | None = None,
         model=e['model'], forecast_id=forecast_id, member=member, 
         domain=e['domain'], obs_type=obs_types[0], variable=variables[0],
         variables=list(variables), variable_info={v: catalog[v] for v in variables},
-        source=str(source), evs_relative=str(evs_relative),
+        var_set_num=var_set_num, source=str(source), evs_relative=str(evs_relative),
         obs_root=str(obs_root) if obs_root else None,
         obs_file=str(obs_file) if obs_file else None,
-        obs_relative=f'rrfs.{valid:%Y%m%d}/rrfs.t{valid:%H}z.prepbufr.tm00',
+        obs_relative=obs_relative_path(valid, obs_types[0]),
         obs_warnings=obs_warnings, evs_root=str(evs_root), missing_evs=missing_evs,
         required_evs_files=required_evs_files, run_dir=str(run_dir),
         env_setup=str(expand(env_setup, env_setup_base)) if env_setup else '',
@@ -357,7 +417,11 @@ def show_plan(s: dict, check_field: bool = False):
     print(f"Env:      {s['env_setup']}")
     print(f"Fix:      {s['fix_root']}")
     print(f"Output:   {s['run_dir']}/work/grid2obs/METplus_output/")
-    print('Steps:    stage symlinks > preprocess ADPSFC > EVS PB2NC > EVS PointStat')
+    subset = "ADPUPA" if s["obs_type"] == "raob" else "ADPSFC"
+    print(
+        f"Steps:    stage symlinks > preprocess {subset} "
+        "> EVS PB2NC > EVS PointStat"
+    )
     problems = issues(s)
 
     for variable in s['variables']:
@@ -378,7 +442,7 @@ def show_plan(s: dict, check_field: bool = False):
         for problem in problems:
             print('  - '+problem)
     else:
-        print('\nPreflight checks passed.  Runtime environment will be initialized by PBS.')
+        print('\nPreflight: Passed.  No blocking issues found.')
     return problems
 
 

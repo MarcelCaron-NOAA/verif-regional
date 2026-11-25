@@ -47,18 +47,16 @@ def discover(evs_root, model="rrfs", obs_type="metar"):
 
         reason = ""
 
-        if (model not in ("rrfs", "hrrr", "rrfsmem") or obs_type != "metar"):
-            reason = "Wrapper currently supports rrfs/hrrr/rrfsmem and METAR only"
+        if (
+            model not in ("rrfs", "hrrr", "rrfsmem") 
+            or obs_type not in ("metar", "raob")
+        ):
+            reason = "Wrapper currently supports rrfs/hrrr/rrfsmem and METAR/RAOB only"
         elif name == "CEILING" and not all(
             key in definition
             for key in ("ceiling_grib_field", "surface_grib_field")
         ):
             reason = "EVS ceiling derivation metadata is missing"
-        elif (
-            any(k.startswith("var2_") for k in definition)
-            and name != "UGRD_VGRD10m"
-        ):
-            reason = "Requires second forecast/observation field"
         else:
             reason = SPECIAL_ADAPTERS.get(name, "")
 

@@ -21,6 +21,7 @@ IDENTITY_FIELDS = (
     "domain",
     "obs_type",
     "variables",
+    "var_set_num",
     "source",
     "obs_file",
     "evs_root",
