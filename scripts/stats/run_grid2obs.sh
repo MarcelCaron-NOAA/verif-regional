@@ -28,6 +28,8 @@ keys={
   'VR_DOMAIN': 'domain',
   'VR_EVS_ROOT':'evs_root',
   'VR_RUN_DIR':'run_dir',
+  'VR_INIT_DATE': 'init_date',
+  'VR_CYCLE': 'cycle',
   'VR_VDATE':'vdate',
   'VR_VHOUR':'vhour',
   'VR_FHR':'fhr',
@@ -219,6 +221,17 @@ entries = {
     'OBS_VAR1_THRESHOLDS': spec['var1_obs_thresholds'],
     'OBS_VAR1_OPTIONS': spec['var1_obs_options'],
 }
+entries["CEILING_GRIB_FIELD"] = spec.get("ceiling_grib_field", "")
+entries["SURFACE_GRIB_FIELD"] = spec.get("surface_grib_field", "")
+
+# Populate the second field when EVS defines one.
+# Export empty values otherwise, avoiding stale settings
+# from previously processed variables.
+for side in ("fcst", "obs"):
+    for attr in ("name", "levels", "thresholds", "options"):
+        entries[
+            f"{side.upper()}_VAR2_{attr.upper()}"
+        ] = spec.get(f"var2_{side}_{attr}", "")
 
 # Always reset output flags between variables.
 # Otherwise values from a previous variable could persist.
@@ -227,8 +240,18 @@ for key in ('CTC', 'SL1L2', 'VL1L2', 'CNT', 'VCNT', 'MCTC'):
         v['output_types'].get(key, 'NONE')
     )
 
-for key in ('FCST_VAR1_OPTIONS', 'OBS_VAR1_OPTIONS'):
+for key in (
+    "FCST_VAR1_LEVELS",
+    "OBS_VAR1_LEVELS",
+    "FCST_VAR2_LEVELS",
+    "OBS_VAR2_LEVELS",
+    'FCST_VAR1_OPTIONS',
+    'OBS_VAR1_OPTIONS',
+    'FCST_VAR2_OPTIONS',
+    'OBS_VAR2_OPTIONS',
+):
     entries[key] = entries[key].replace(r'\"', '"')
+
 Path(sys.argv[2]).write_text(''.join(
     f'export {key}={shlex.quote(str(value))}\n'
     for key, value in entries.items()
@@ -238,8 +261,88 @@ PY
     # shellcheck disable=SC1090
     source "$var_env"
 
-    run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
-        -c "$MET_PLUS_CONF/PointStat_fcstCAM_obsMETAR.conf"
+    if [[ "$VAR_NAME" == "PTYPE" ]]; then
+        echo "Creating merged PTYPE forecast using EVS"
+
+        export job_type=generate
+        export njob=0
+
+        saved_met_plus_out="$MET_PLUS_OUT"
+
+        # This layout is expected by EVS's merged-ptype script.
+        export MET_PLUS_OUT="$DATA/grid2obs/METplus_output/workdirs/generate/$job_name"
+
+        run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
+            -c "$MET_PLUS_CONF/RegridDataPlane_fcstCAM_PTYPE.conf"
+
+        regrid_file="$MET_PLUS_OUT/$VERIF_TYPE/regrid_data_plane/${MODELNAME}.${VDATE}/regrid_data_plane_${MODELNAME}_t${VHOUR}z_${VERIF_TYPE}_${NEST}_${job_name}_fhr${FHR}.nc"
+
+        [[ -s "$regrid_file" ]] || {
+            echo "ERROR: PTYPE regridded input missing: $regrid_file" >&2
+            exit 8
+        }
+
+        merged_dir="$DATA/grid2obs/data/$MODELNAME/merged_ptype"
+        mkdir -p "$merged_dir"
+
+        python3 "$USHevs/cam/cam_stats_grid2obs_create_merged_ptype.py"
+
+        # Restore normal METplus output paths for PointStat.
+        export MET_PLUS_OUT="$saved_met_plus_out"
+
+        printf -v fhr3 '%03d' "$VR_FHR"
+        init_ymdh="${VR_INIT_DATE}${VR_CYCLE}"
+
+        merged_file="$merged_dir/merged_ptype_${VERIF_TYPE}_${NEST}_${job_name}_init${init_ymdh}_fhr${fhr3}.nc"
+
+        [[ -s "$merged_file" ]] || {
+            echo "ERROR: PTYPE merged file missing: $merged_file" >&2
+            exit 8
+        }
+
+        echo "Merged PTYPE output: $merged_file"
+    fi
+
+    if [[ "$VAR_NAME" == "CEILING" ]]; then
+        echo "Deriving forecast CEILING_AGL using EVS PCPCombine"
+
+        printf -v fhr3 '%03d' "$VR_FHR"
+
+        export CEILING_AGL_DIR="$DATA/grid2obs/data/$MODELNAME/tmp"
+        export CEILING_AGL_FILENAME="ceiling_agl.${NEST}.t${VHOUR}z.f${fhr3}.nc"
+        export CEILING_FCST_FILE="$VR_FORECAST"
+
+        mkdir -p "$CEILING_AGL_DIR"
+
+        run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
+            -c "$MET_PLUS_CONF/PCPCombine_fcstCAM_CEILING.conf"
+
+        derived="$CEILING_AGL_DIR/$CEILING_AGL_FILENAME"
+
+        [[ -s "$derived" ]] || {
+            echo "ERROR: CEILING_AGL output missing or empty: $derived" >&2
+            exit 8
+        }
+
+        echo "Derived CEILING_AGL: $derived"
+    fi
+
+    point_conf="PointStat_fcstCAM_obsMETAR.conf"
+
+    if [[ "$VAR_NAME" == "CEILING" ]]; then
+        run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
+            -c "$MET_PLUS_CONF/$point_conf" \
+            -c "$MET_PLUS_CONF/PointStat_fcstCAM_obsMETAR_CEILING.conf"
+    elif [[ "$VAR_NAME" == "PTYPE" ]]; then
+        run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
+            -c "$MET_PLUS_CONF/PointStat_fcstCAM_obsMETAR_PTYPE.conf"
+    elif [[ -n "${FCST_VAR2_NAME:-}" ]]; then
+        run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
+            -c "$MET_PLUS_CONF/PointStat_fcstCAM_obsMETAR_VAR2.conf"
+    else
+        run_metplus.py -c "$PARMevs/metplus_config/machine.conf" \
+            -c "$MET_PLUS_CONF/$point_conf"
+    fi
 
     # Check for the requested variable and forecast hour,
     # not just any existing STAT output.

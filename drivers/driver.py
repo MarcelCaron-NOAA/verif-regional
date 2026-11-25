@@ -42,6 +42,7 @@ REQUIRED_EVS_FILES = [
     'ush/cam/cam_stats_grid2obs_var_defs.py',
     'parm/metplus_config/stats/cam/grid2obs/PB2NC_obsMETAR.conf',
     'parm/metplus_config/stats/cam/grid2obs/PointStat_fcstCAM_obsMETAR.conf',
+    'parm/metplus_config/stats/cam/grid2obs/PointStat_fcstCAM_obsMETAR_VAR2.conf',
     'parm/metplus_config/machine.conf',
 ]
 
@@ -233,6 +234,21 @@ def spec(config_path: Path, evs_option: str | None = None,
         'parm/evs_config/cam/'
         f'config.evs.prod.stats.cam.atmos.grid2obs.{profile}'
     ]
+    if "CEILING" in variables:
+        required_evs_files.extend([
+            "parm/metplus_config/stats/cam/grid2obs/"
+            "PCPCombine_fcstCAM_CEILING.conf",
+            "parm/metplus_config/stats/cam/grid2obs/"
+            "PointStat_fcstCAM_obsMETAR_CEILING.conf",
+        ])
+    if "PTYPE" in variables:
+        required_evs_files.extend([
+            "parm/metplus_config/stats/cam/grid2obs/"
+            "RegridDataPlane_fcstCAM_PTYPE.conf",
+            "parm/metplus_config/stats/cam/grid2obs/"
+            "PointStat_fcstCAM_obsMETAR_PTYPE.conf",
+            "ush/cam/cam_stats_grid2obs_create_merged_ptype.py",
+        ])
 
     missing_evs = [
         x for x in required_evs_files

@@ -16,8 +16,6 @@ BASELINE_TESTED = {
 
 # Special processing that the current runner does not implement.
 SPECIAL_ADAPTERS = {
-    "PTYPE": "Requires PTYPE-specific derived-field processing",
-    "WIND10m": "Wind-speed field handling needs verification",
 }
 
 
@@ -51,12 +49,15 @@ def discover(evs_root, model="rrfs", obs_type="metar"):
 
         if (model not in ("rrfs", "hrrr", "rrfsmem") or obs_type != "metar"):
             reason = "Wrapper currently supports rrfs/hrrr/rrfsmem and METAR only"
-        elif (
-            "ceiling_grib_field" in definition
-            or "surface_grib_field" in definition
+        elif name == "CEILING" and not all(
+            key in definition
+            for key in ("ceiling_grib_field", "surface_grib_field")
         ):
-            reason = "Requires EVS PCPCombine ceiling AGL preprocessing"
-        elif any(k.startswith("var2_") for k in definition):
+            reason = "EVS ceiling derivation metadata is missing"
+        elif (
+            any(k.startswith("var2_") for k in definition)
+            and name != "UGRD_VGRD10m"
+        ):
             reason = "Requires second forecast/observation field"
         else:
             reason = SPECIAL_ADAPTERS.get(name, "")
@@ -82,9 +83,17 @@ def check_field(source, entry):
     """Check simple EVS fields with wgrib2; defer complex selectors."""
 
     definition = entry["definition"]
+    if definition.get("var1_fcst_name") == "PTYPE":
+        return "not checked (PTYPE is derived from categorical forecast fields)"
+    if "ceiling_grib_field" in definition:
+        return "not checked (CEILING_AGL is derived during execution)"
     field = definition.get("var1_fcst_name", "")
     level = definition.get("var1_fcst_levels", "")
     options = definition.get("var1_fcst_options", "")
+    if field == "WIND" and level == "Z10":
+        return (
+            "not checked (MET can derive WIND from UGRD/VGRD)"
+        )
 
     # GRIB template-dependent fields require a more precise selector.
     if "GRIB2_ipdtmpl_" in options:
