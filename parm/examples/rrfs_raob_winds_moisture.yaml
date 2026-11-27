@@ -1,0 +1,40 @@
+# Prototype: one RRFS F06 forecast valid at 06Z November 15, 2026.
+experiment:
+  name: rrfs_raob_winds_moisture
+  domain: conus
+  init_date: "20261120"
+  cycle: 0
+  forecast_hour: 12
+
+model:
+  id: rrfs
+  verification_profile: rrfs
+
+verification:
+  grid2obs:
+    observations: [raob]
+    variables: [UGRD, VGRD, UGRD_VGRD, SPFH]
+
+input:
+  root: /lfs/h1/ops/prod/com/rrfs/v1.0
+  template: "rrfs.{init_date}/{cycle}/rrfs.t{cycle}z.prslev.3km.f{fhr:03d}.conus.grib2"
+
+observations:
+  # 'auto' searches active RRFS prepbufr data in obsproc/v*.
+  # You can specify a complete version root if multiple versions exist.
+  root: /lfs/h1/ops/prod/com/obsproc/v1.3
+
+output:
+  root: /lfs/h2/emc/stmp/${USER}/verif-regional
+
+machine:
+  profile: ../machines/wcoss2.yaml
+
+environment:
+  # Optional site script to source inside PBS job; must load Python, MET,
+  # METplus, BUFR, and expose run_metplus.py and wgrib2. Blank = use inherited.
+  setup_script: ''
+  # External EVS fix root containing masks/Bukovsky_G240_CONUS.nc.
+  # Blank uses $FIXevs if set by environment, or <evs>/fix if present.
+  fix_root: ''
+

@@ -1,9 +1,17 @@
-# Edit account before calling 'write-job' or 'submit'.
+# WCOSS2 machine configuration
+
+name: WCOSS2
+
 scheduler: pbs
 account: RRFS-DEV
 queue: dev
 memory: 100gb
 walltime: '01:00:00'
+
 environment:
   setup_script: wcoss2_env.sh
   fix_root: /lfs/h2/emc/vpppg/noscrub/emc.vpppg/verification/EVS_fix
+
+paths:
+  obsproc_root: /lfs/h1/ops/prod/com/obsproc
+
