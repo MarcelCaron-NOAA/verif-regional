@@ -52,6 +52,25 @@ exports += (
     f'{shlex.quote(" ".join(variables))}\n'
 )
 
+sets = info["variable_sets"]
+exports += (
+    "export VR_VARIABLE_SETS="
+    + shlex.quote(
+        " ".join(str(sets[v]) for v in variables)
+    )
+    + "\n"
+)
+
+staged_by_set = info["forecast_staged_by_set"]
+
+for set_num in ("0", "1"):
+    path = staged_by_set.get(set_num, "")
+    exports += (
+        f"export VR_FORECAST_SET_{set_num}="
+        f"{shlex.quote(str(path))}\n"
+    )
+
+
 Path(sys.argv[2]).write_text(exports)
 PY
 # shellcheck disable=SC1090
@@ -120,10 +139,18 @@ config="$PARMevs/evs_config/cam/config.evs.prod.stats.cam.atmos.grid2obs.${VR_MO
 echo "EVS variable set: $var_set_num"
 source "$config"
 # Verify that EVS's live template resolves to exactly our staged file.
-resolved_fcst="$(python3 -c 'import cam_util as c; import os; print(c.get_cam_fcst_file_path(
-    VERIF_CASE="grid2obs", job_type="generate", COMINfcst=os.environ["COMINfcst"],
-    MODEL_INPUT_TEMPLATE=os.environ["MODEL_INPUT_TEMPLATE"],
-    VDATE=os.environ["VDATE"], VHOUR=os.environ["VHOUR"], FHR=os.environ["FHR"]))')"
+
+resolve_evs_forecast() {
+    python3 -c 'import cam_util as c; import os; print(c.get_cam_fcst_file_path(
+        VERIF_CASE="grid2obs", job_type="generate",
+        COMINfcst=os.environ["COMINfcst"],
+        MODEL_INPUT_TEMPLATE=os.environ["MODEL_INPUT_TEMPLATE"],
+        VDATE=os.environ["VDATE"], VHOUR=os.environ["VHOUR"],
+        FHR=os.environ["FHR"]))'
+}
+
+resolved_fcst="$(resolve_evs_forecast)"
+
 if [[ "$resolved_fcst" != "$VR_FORECAST" ]]; then
     echo 'EVS forecast template does not match staged input:' >&2
     echo "  EVS resolves: $resolved_fcst" >&2
@@ -200,6 +227,12 @@ echo "Forecast: $MODELNAME (EVS profile: $VR_MODEL)"
 
 # One PB2NC output is shared by all requested variables.
 read -r -a requested_variables <<< "$VR_VARIABLES"
+read -r -a requested_sets <<< "$VR_VARIABLE_SETS"
+
+if (( ${#requested_variables[@]} != ${#requested_sets[@]} )); then
+    echo "ERROR: Variable/product mapping is inconsistent" >&2
+    exit 8
+fi
 
 if (( ${#requested_variables[@]} == 0 )); then
     echo "No grid2obs variables requested" >&2
@@ -209,8 +242,48 @@ fi
 stat_root="$MET_PLUS_OUT/$VERIF_TYPE/point_stat"
 shopt -s nullglob globstar
 
-for variable in "${requested_variables[@]}"; do
+
+for idx in "${!requested_variables[@]}"; do
+    variable="${requested_variables[$idx]}"
+    set_num="${requested_sets[$idx]}"
+
     export VAR_NAME="$variable"
+    export var_set_num="$set_num"
+
+    case "$set_num" in
+        0) export VR_FORECAST="$VR_FORECAST_SET_0" ;;
+        1) export VR_FORECAST="$VR_FORECAST_SET_1" ;;
+        *)
+            echo "ERROR: Unsupported EVS variable set: $set_num" >&2
+            exit 8
+            ;;
+    esac
+
+    [[ -s "$VR_FORECAST" ]] || {
+        echo "ERROR: Missing forecast for $VAR_NAME: $VR_FORECAST" >&2
+        exit 8
+    }
+
+    # Read the correct forecast template from EVS, without
+    # re-sourcing its entire configuration into the main shell.
+    MODEL_INPUT_TEMPLATE="$(
+        export var_set_num="$set_num"
+        source "$config" >/dev/null
+        printf '%s' "$MODEL_INPUT_TEMPLATE"
+    )"
+    export MODEL_INPUT_TEMPLATE
+
+    resolved_fcst="$(resolve_evs_forecast)"
+
+    if [[ "$resolved_fcst" != "$VR_FORECAST" ]]; then
+        echo "ERROR: EVS forecast template mismatch for $VAR_NAME" >&2
+        echo "  EVS:    $resolved_fcst" >&2
+        echo "  Staged: $VR_FORECAST" >&2
+        exit 8
+    fi
+
+    echo "Forecast product: $VR_FORECAST (EVS set $set_num)"
+
     export job_name="vr_${MODELNAME}_${VAR_NAME}"
 
     echo "=================================================="

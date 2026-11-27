@@ -1,0 +1,49 @@
+# Prototype: one RRFS F06 forecast valid at 06Z November 15, 2026.
+experiment:
+  name: hrrr_raob_mixedcheck
+  domain: conus
+  init_date: "20261120"
+  cycle: 0
+  forecast_hour: 12
+
+model:
+  id: hrrr
+  verification_profile: hrrr
+
+verification:
+  grid2obs:
+    observations: [raob]
+    variables:
+      - HGT
+      - TMP
+      - UGRD
+      - VGRD
+      - UGRD_VGRD
+      - SPFH
+      - SBCAPE
+      - MLCAPE
+      - HPBL
+
+input:
+  root: /lfs/h1/ops/prod/com/hrrr/v4.1
+  template: "hrrr.{init_date}/conus/hrrr.t{cycle}z.wrfprsf{fhr:02d}.grib2"
+
+observations:
+  # 'auto' searches active RRFS prepbufr data in obsproc/v*.
+  # You can specify a complete version root if multiple versions exist.
+  root: /lfs/h1/ops/prod/com/obsproc/v1.3
+
+output:
+  root: /lfs/h2/emc/stmp/${USER}/verif-regional
+
+machine:
+  profile: ../machines/wcoss2.yaml
+
+environment:
+  # Optional site script to source inside PBS job; must load Python, MET,
+  # METplus, BUFR, and expose run_metplus.py and wgrib2. Blank = use inherited.
+  setup_script: ''
+  # External EVS fix root containing masks/Bukovsky_G240_CONUS.nc.
+  # Blank uses $FIXevs if set by environment, or <evs>/fix if present.
+  fix_root: ''
+

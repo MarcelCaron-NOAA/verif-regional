@@ -54,6 +54,20 @@ def get_var_set_num(profile, obs_type, variable):
 
 
 
+def get_product_key(obs_type, var_set_num):
+    """User-facing name for an EVS forecast product group."""
+    if obs_type == "metar" and var_set_num == 0:
+        return "surface"
+    if obs_type == "raob":
+        if var_set_num == 0:
+            return "pressure"
+        if var_set_num == 1:
+            return "surface"
+    raise ValueError(
+        f"Unsupported product group: {obs_type}/{var_set_num}"
+    )
+
+
 def get_staging_template(
     profile, obs_type="metar", var_set_num=0
 ):

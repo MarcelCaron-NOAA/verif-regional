@@ -30,7 +30,7 @@ if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
 from ush.evs_catalog import discover, check_field
-from ush.model_profiles import get_staging_template, get_var_set_num, validate_member
+from ush.model_profiles import get_product_key, get_staging_template, get_var_set_num, validate_member
 from ush.task_planner import requested_hours, requested_cases
 from ush.task_state import ensure_safe_run, record_submission
 
@@ -54,6 +54,81 @@ def read_yaml(path: Path) -> dict:
     if not isinstance(data, dict):
         raise ValueError(f"Expected YAML mapping at {path}")
     return data
+
+
+
+def grid2obs_requests(cfg):
+    """Return ordered (observation type, variables) requests.
+
+    Accept both:
+      grid2obs:
+        metar: [TMP2m]
+        raob: [TMP, HGT]
+
+    and the original:
+      grid2obs:
+        observations: [metar]
+        variables: [TMP2m]
+    """
+    verification = cfg.get("verification")
+
+    if (
+        not isinstance(verification, dict)
+        or set(verification) != {"grid2obs"}
+    ):
+        raise ValueError(
+            "Currently only verification.grid2obs is supported"
+        )
+
+    grid = verification["grid2obs"]
+    if not isinstance(grid, dict) or not grid:
+        raise ValueError(
+            "verification.grid2obs must be a nonempty mapping"
+        )
+
+    legacy = (
+        "observations" in grid or "variables" in grid
+    )
+
+    if legacy:
+        if set(grid) != {"observations", "variables"}:
+            raise ValueError(
+                "Do not mix the old observations/variables "
+                "syntax with the new observation mapping"
+            )
+
+        obs_types = grid["observations"]
+        if not isinstance(obs_types, list) or len(obs_types) != 1:
+            raise ValueError(
+                "Legacy grid2obs requires exactly one "
+                "observation type"
+            )
+
+        requests = [(obs_types[0], grid["variables"])]
+    else:
+        requests = list(grid.items())
+
+    for obs_type, variables in requests:
+        if obs_type not in ("metar", "raob"):
+            raise ValueError(
+                f"Unsupported grid2obs observation type: {obs_type}"
+            )
+
+        if (
+            not isinstance(variables, list)
+            or not variables
+            or any(
+                not isinstance(v, str) or not v
+                for v in variables
+            )
+            or len(variables) != len(set(variables))
+        ):
+            raise ValueError(
+                f"grid2obs.{obs_type} requires a nonempty "
+                "list of distinct variable names"
+            )
+
+    return requests
 
 
 def expand(path: str, relative_to: Path | None = None) -> Path:
@@ -91,7 +166,7 @@ def time_case(expt: dict, obs_type="metar") -> tuple[dt.datetime, dt.datetime, i
 
 def source_paths(config: dict, initial: dt.datetime, valid: dt.datetime, 
                  fhr: int, profile="rrfs", member=None, obs_type="metar",
-                 var_set_num=0):
+                 var_set_num=0, template_override=None):
     inp = config['input']
     root = expand(inp['root'])
     fields = dict(init_date=initial.strftime('%Y%m%d'), cycle=initial.strftime('%H'),
@@ -100,7 +175,11 @@ def source_paths(config: dict, initial: dt.datetime, valid: dt.datetime,
     staging_template = get_staging_template(
         profile, obs_type, var_set_num
     )
-    template = inp.get('template', staging_template)
+    template = (
+        template_override
+        if template_override is not None
+        else inp.get('template', staging_template)
+    )
     try:
         rel_src = template.format(**fields)
         rel_evs = staging_template.format(**fields)
@@ -163,29 +242,39 @@ def resolve_obs_root(
 
 def spec(config_path: Path, evs_option: str | None = None, 
          fhr_override: int | None = None, init_date_override: str | None = None,
-         cycle_override: int | None = None):
+         cycle_override: int | None = None, obs_type_override=None):
     cfg = read_yaml(config_path)
     
-    verification = cfg.get('verification') or {}
-    if set(verification) != {'grid2obs'}:
-        raise ValueError(
-            "Currently only verification.grid2obs is supported"
-        )
-    grid2obs = verification['grid2obs']
-    obs_types = grid2obs.get('observations', [])
-    variables = grid2obs.get('variables', [])
+    
+    requests = grid2obs_requests(cfg)
 
-    if (
-        obs_types not in (['metar'], ['raob'])
-        or not isinstance(variables, list)
-        or not variables
-        or any(type(v) is not str for v in variables)
-        or len(variables) != len(set(variables))
-    ):
-        raise ValueError(
-            "Expected observations: [metar] or [raob] and a nonempty "
-            "list of distinct grid2obs variables"
-        )
+    if obs_type_override is None:
+        if len(requests) != 1:
+            raise ValueError(
+                "Configuration requests multiple observation "
+                "types; select one with obs_type_override"
+            )
+        obs_type, variables = requests[0]
+    else:
+        request_map = dict(requests)
+
+        if obs_type_override not in request_map:
+            raise ValueError(
+                f"Observation type not requested: "
+                f"{obs_type_override}"
+            )
+
+        obs_type = obs_type_override
+        variables = request_map[obs_type]
+
+    # Preserve the existing internal interface.
+    obs_types = [obs_type]
+
+    observation_mapping = (
+        "observations"
+        not in cfg["verification"]["grid2obs"]
+    )
+
     e = dict(cfg['experiment'])
     
     if 'model' in cfg and 'forecast' in cfg:
@@ -243,16 +332,8 @@ def spec(config_path: Path, evs_option: str | None = None,
         for variable in variables
     }
 
-    required_sets = set(var_sets.values())
-
-    if len(required_sets) != 1:
-        raise ValueError(
-            "Requested variables require multiple forecast "
-            "products. Mixed-product staging is not yet "
-            "supported; use separate experiments for now."
-        )
-
-    var_set_num = required_sets.pop()
+    required_sets = sorted(set(var_sets.values()))
+    var_set_num = required_sets[0]
 
     if init_date_override is not None:
         e['init_date'] = init_date_override
@@ -263,10 +344,65 @@ def spec(config_path: Path, evs_option: str | None = None,
     init, valid, fhr = time_case(e, obs_types[0])
     if not re.fullmatch(r'[a-zA-Z0-9_-]+', e['name']):
         raise ValueError('experiment.name must contain only letters, numbers, hyphen, underscore')
-    source, evs_relative = source_paths(
-        cfg, init, valid, fhr, profile=profile, member=member, 
-        obs_type=obs_types[0], var_set_num=var_set_num
-    )
+    
+    # Resolve each required EVS product independently.
+    inp = cfg["input"]
+    templates = inp.get("templates", {})
+
+    if not isinstance(templates, dict):
+        raise ValueError("input.templates must be a YAML mapping")
+
+    unknown_products = set(templates) - {"pressure", "surface"}
+    if unknown_products:
+        raise ValueError(
+            f"Unknown input template products: {sorted(unknown_products)}"
+        )
+
+    if "template" in inp and "templates" in inp:
+        raise ValueError(
+            "Use input.template or input.templates, not both"
+        )
+
+    if len(required_sets) > 1 and "template" in inp:
+        raise ValueError(
+            "Mixed-product verification cannot use one input.template. "
+            "Use input.templates with pressure/surface entries, or "
+            "remove input.template to use EVS filename conventions."
+        )
+
+    forecast_inputs = {}
+
+    for set_num in required_sets:
+        product = get_product_key(obs_types[0], set_num)
+        override = templates.get(product)
+
+        if override is not None and (
+            not isinstance(override, str) or not override.strip()
+        ):
+            raise ValueError(
+                f"input.templates.{product} must be a nonempty string"
+            )
+
+        product_source, product_relative = source_paths(
+            cfg, init, valid, fhr,
+            profile=profile,
+            member=member,
+            obs_type=obs_types[0],
+            var_set_num=set_num,
+            template_override=override,
+        )
+
+        forecast_inputs[str(set_num)] = {
+            "product": product,
+            "source": str(product_source),
+            "evs_relative": str(product_relative),
+        }
+
+    # Preserve existing single-product fields for compatibility.
+    primary = forecast_inputs[str(var_set_num)]
+    source = primary["source"]
+    evs_relative = primary["evs_relative"]
+
     machine_cfg = expand(
         cfg['machine']['profile'], config_path.parent
     )
@@ -278,7 +414,14 @@ def spec(config_path: Path, evs_option: str | None = None,
         obs_type=obs_types[0],
     )
     output_root = expand(cfg['output']['root'])
-    case_name = f"{e['name']}_{init:%Y%m%d%H}_f{fhr:03d}"
+    
+    case_name = (
+        f"{e['name']}_{init:%Y%m%d%H}_f{fhr:03d}"
+    )
+
+    if observation_mapping:
+        case_name += f"_{obs_type}"
+
     run_dir = output_root / case_name
     evs_root = expand(evs_option or os.getenv('VERIF_REGIONAL_EVS_ROOT') or str(REPO / 'evs'))
     required_evs_files = REQUIRED_EVS_FILES + [
@@ -355,10 +498,12 @@ def spec(config_path: Path, evs_option: str | None = None,
         model=e['model'], forecast_id=forecast_id, member=member, 
         domain=e['domain'], obs_type=obs_types[0], variable=variables[0],
         variables=list(variables), variable_info={v: catalog[v] for v in variables},
-        var_set_num=var_set_num, source=str(source), evs_relative=str(evs_relative),
+        var_set_num=var_set_num, variable_sets=var_sets, forecast_inputs=forecast_inputs, 
+        source=str(source), evs_relative=str(evs_relative),
         obs_root=str(obs_root) if obs_root else None,
         obs_file=str(obs_file) if obs_file else None,
-        obs_relative=obs_relative_path(valid, obs_types[0]),
+        obs_relative=obs_relative_path(valid, obs_types[0]), 
+        observation_mapping=observation_mapping,
         obs_warnings=obs_warnings, evs_root=str(evs_root), missing_evs=missing_evs,
         required_evs_files=required_evs_files, run_dir=str(run_dir),
         env_setup=str(expand(env_setup, env_setup_base)) if env_setup else '',
@@ -369,6 +514,12 @@ def spec(config_path: Path, evs_option: str | None = None,
 
 def issues(s: dict) -> list[str]:
     errors = []
+    for product in s["forecast_inputs"].values():
+        if not Path(product["source"]).is_file():
+            errors.append(
+                f"{product['product']} forecast missing: "
+                f"{product['source']}"
+            )
     if not Path(s['source']).is_file():
         errors.append(f"Forecast missing: {s['source']}")
     if not s['obs_file'] or not Path(s['obs_file']).is_file():
@@ -396,6 +547,11 @@ def field_check(source: str, variable: str, s: dict):
     return check_field(source, s['variable_info'][variable])
 
 
+def variable_source(s, variable):
+    set_num = str(s["variable_sets"][variable])
+    return s["forecast_inputs"][set_num]["source"]
+
+
 def show_plan(s: dict, check_field: bool = False):
     print(f"Case:     {s['experiment']}")
     print(
@@ -409,9 +565,16 @@ def show_plan(s: dict, check_field: bool = False):
     )
     print(f"Init:     {s['init_date']} {s['cycle']}Z  F{s['fhr']:03d}")
     print(f"Valid:    {s['vdate']} {s['vhour']}Z")
-    print(f"Source:   {s['source']}")
     print(f"Obs:      {s['obs_file'] or '(unresolved)'}")
-    print(f"Staging:  {s['run_dir']}/input/{s['evs_relative']}")
+    for set_num in sorted(s["forecast_inputs"], key=int):
+        product = s["forecast_inputs"][set_num]
+        label = product["product"]
+
+        print(f"Source ({label}):  {product['source']}")
+        print(
+            f"Staging ({label}): "
+            f"{s['run_dir']}/input/{product['evs_relative']}"
+        )
     print(f"EVS:      {s['evs_root']}")
     print(f"Machine:  {s['machine'].get('name', 'unknown')}")
     print(f"Env:      {s['env_setup']}")
@@ -430,7 +593,7 @@ def show_plan(s: dict, check_field: bool = False):
         print(f"{variable}: {info['status']}")
 
         if check_field:
-            result = field_check(s['source'], variable, s)
+            result = field_check(variable_source(s, variable), variable, s)
             print(f"  GRIB2: {result}")
 
             if result.startswith(('MISSING:', 'FAILED:')):
@@ -464,7 +627,7 @@ def stage(s: dict):
     
     # Check every requested forecast field.
     for variable in s['variables']:
-        field_status = field_check(s['source'], variable, s)
+        field_status = field_check(variable_source(s, variable), variable, s)
 
         if field_status.startswith(('MISSING:', 'FAILED:')):
             raise RuntimeError(
@@ -483,10 +646,23 @@ def stage(s: dict):
     run = Path(s['run_dir'])
     for folder in ['input', 'jobs', 'logs', 'work']:
         (run / folder).mkdir(parents=True, exist_ok=True)
-    staged_fcst = run / 'input' / s['evs_relative']
-    staged_obs = run / 'input' / 'obsproc' / s['obs_relative']
-    symlink_checked(Path(s['source']), staged_fcst)
-    symlink_checked(Path(s['obs_file']), staged_obs)
+    
+    staged_by_set = {}
+
+    for set_num, product in s["forecast_inputs"].items():
+        staged = run / "input" / product["evs_relative"]
+
+        symlink_checked(
+            Path(product["source"]),
+            staged,
+        )
+        staged_by_set[set_num] = str(staged)
+
+    staged_fcst = Path(staged_by_set[str(s["var_set_num"])])
+
+    staged_obs = run / "input" / "obsproc" / s["obs_relative"]
+    symlink_checked(Path(s["obs_file"]), staged_obs)
+
     manifest = {
         k: v for k, v in s.items()
         if k not in ('machine', 'missing_evs', 'obs_warnings', 'variable_info')
@@ -494,6 +670,7 @@ def stage(s: dict):
     manifest['forecast_staged'] = str(staged_fcst)
     manifest['obs_staged'] = str(staged_obs)
     manifest['forecast_stage_root'] = str(run / 'input')
+    manifest['forecast_staged_by_set'] = staged_by_set
     manifest['obs_stage_root'] = str(run / 'input' / 'obsproc')
     manifest['evs_fingerprints'] = {
         x: hashlib.sha256((Path(s['evs_root']) / x).read_bytes()).hexdigest()
@@ -510,14 +687,30 @@ def stage(s: dict):
     manifest['evs_git_sha'] = git_sha
     target = run / 'manifest.json'
     target.write_text(json.dumps(manifest, indent=2)+'\n')
-    print(f'Staged two symlinks and wrote: {target}')
+    print(
+        f"Staged {len(staged_by_set) + 1} symlinks "
+        f"and wrote: {target}"
+    )
     return target
 
 
 def job_details(s: dict):
-    job_name = (
-        f"vr_{s['init_date'][4:]}{s['cycle']}_f{s['fhr']:03d}"
-    )
+    
+    if s.get("observation_mapping"):
+        # Keep names short for PBS while distinguishing tasks.
+        # Example: vr_m112000_f012 or vr_r112000_f012
+        job_name = (
+            f"vr_{s['obs_type'][0]}"
+            f"{s['init_date'][4:]}{s['cycle']}"
+            f"_f{s['fhr']:03d}"
+        )
+    else:
+        # Preserve existing naming for legacy configurations.
+        job_name = (
+            f"vr_{s['init_date'][4:]}{s['cycle']}"
+            f"_f{s['fhr']:03d}"
+        )
+
     log_file = (
         Path(s['run_dir']) / 'logs' / f'{job_name}.log'
     )
@@ -625,8 +818,18 @@ def main(argv=None):
                 f"Configuration YAML required for {args.command}"
             )
         config_path = args.config.resolve()
+        
         cfg = read_yaml(config_path)
-        cases = requested_cases(cfg)
+
+        time_cases = requested_cases(cfg)
+        requests = grid2obs_requests(cfg)
+
+        cases = [
+            (init_date, cycle, hour, obs_type)
+            for init_date, cycle, hour in time_cases
+            for obs_type, _ in requests
+        ]
+
         if args.command == "submit":
             if args.max_submit < 1:
                 raise ValueError("--max-submit must be positive")
@@ -641,17 +844,32 @@ def main(argv=None):
         processed = 0
         skipped = 0
 
-        for init_date, cycle, hour in cases:
+        
+        # Resolve and validate every task before starting submission.
+        # A malformed RAOB request must not be discovered only
+        # after the METAR jobs have already been submitted.
+        prepared = []
+
+        for init_date, cycle, hour, obs_type in cases:
             s = spec(
                 config_path,
                 args.evs_root,
                 fhr_override=hour,
                 init_date_override=init_date,
                 cycle_override=cycle,
+                obs_type_override=obs_type,
+            )
+            prepared.append(
+                (init_date, cycle, hour, obs_type, s)
             )
 
+        for init_date, cycle, hour, obs_type, s in prepared:
+
             print(f"\n{'=' * 50}")
-            print(f"Init {init_date} {cycle:02d}Z / F{hour:03d}")
+            print(
+                f"Init {init_date} {cycle:02d}Z / "
+                f"F{hour:03d} / {obs_type.upper()}"
+            )
             print(f"{'=' * 50}")
 
             if args.command == 'plan':

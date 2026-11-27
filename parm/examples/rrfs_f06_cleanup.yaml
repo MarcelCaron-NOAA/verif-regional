@@ -1,0 +1,34 @@
+# Prototype: one RRFS F06 forecast valid at 06Z November 15, 2026.
+experiment:
+  name: rrfs_cleanupcheck
+  model: rrfs
+  domain: conus
+  verification: grid2obs_metar_tmp2m
+  init_date: '20261115'
+  cycle: 0
+  forecast_hour: 6
+
+input:
+  root: /lfs/h1/ops/prod/com/rrfs/v1.0
+  # Optional: customize for arbitrary developer layouts, e.g.
+  # template: 'my_run/{init_date}/{cycle}/forecast_f{fhr:03d}.grib2'
+
+observations:
+  # 'auto' searches active RRFS prepbufr data in obsproc/v*.
+  # You can specify a complete version root if multiple versions exist.
+  root: auto
+
+output:
+  root: /lfs/h2/emc/stmp/${USER}/verif-regional
+
+machine:
+  profile: ../machines/wcoss2.yaml
+
+environment:
+  # Optional site script to source inside PBS job; must load Python, MET,
+  # METplus, BUFR, and expose run_metplus.py and wgrib2. Blank = use inherited.
+  setup_script: ''
+  # External EVS fix root containing masks/Bukovsky_G240_CONUS.nc.
+  # Blank uses $FIXevs if set by environment, or <evs>/fix if present.
+  fix_root: ''
+
